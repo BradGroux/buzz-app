@@ -307,8 +307,9 @@ export class CodexRuntime {
     return entry;
   }
   private storageKey(request: Request) {
-    // Resume restores the persisted tool schema; pre-tools bindings start fresh.
-    return `buzz.codex.sessions.v3:${request.scope}:${request.agent.pubkey}`;
+    // Resume restores the persisted tool schema, so a binding from before a
+    // tool change starts fresh. v4 added media_get.
+    return `buzz.codex.sessions.v4:${request.scope}:${request.agent.pubkey}`;
   }
   private save(request: Request, entry: Entry, key: string, saved: Saved) {
     entry.saved[key] = saved;
@@ -539,7 +540,7 @@ export class CodexRuntime {
         }
       },
     });
-    const text = await callTool(
+    const reply = await callTool(
       client,
       {
         channel: request.conversation.channelId,
@@ -553,7 +554,17 @@ export class CodexRuntime {
       active.sentVersion = Math.max(active.sentVersion ?? -1, version);
       for (const taken of answering) taken.answered();
     }
-    return { success: true, contentItems: [{ type: "inputText", text }] };
+    return {
+      success: true,
+      contentItems: [
+        typeof reply === "string"
+          ? { type: "inputText", text: reply }
+          : {
+              type: "inputImage",
+              imageUrl: `data:${reply.type};base64,${reply.data}`,
+            },
+      ],
+    };
   }
   private async terminals(rpc: AppServer, threadId: string) {
     // Interrupt acknowledges the turn, not the death of separately grouped shells.
