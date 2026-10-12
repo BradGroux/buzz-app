@@ -1,8 +1,9 @@
-import type {
-  Agent,
-  AgentHandle,
-  Delivery,
-  Models,
+import {
+  fromOwner,
+  type Agent,
+  type AgentHandle,
+  type Delivery,
+  type Models,
 } from "../../features/agents2/service";
 import type { RelayData } from "../../features/relay/service";
 import type { EventData } from "../../features/relay/events";
@@ -329,7 +330,7 @@ export class CodexRuntime {
       throw new Error(
         "Codex timers are not supported yet; use mentions or event watches.",
       );
-    if (trigger.event.pubkey !== agent.owner) return;
+    if (!(await fromOwner(trigger.event, agent.owner))) return;
     const snapshot = this.relay(agent.pubkey)?.snapshot();
     if (snapshot?.status !== "ready")
       throw new Error("Connect to the agent's community first");
@@ -468,14 +469,12 @@ export class CodexRuntime {
     );
   }
   private publish(request: Request, content: string) {
-    const root = rootOf(request.event);
     return request.agent.publish({
       kind: 9,
       content,
       tags: [
         ["h", request.conversation.channelId],
-        ...(root === request.event.id ? [] : [["e", root, "", "root"]]),
-        ["e", request.event.id, "", "reply"],
+        ["e", rootOf(request.event), "", "reply"],
         ["p", request.event.pubkey],
       ],
     });
@@ -542,11 +541,7 @@ export class CodexRuntime {
         ...(request.toolRoot ? { root: request.toolRoot } : {}),
       },
       call.tool,
-      call.tool === "send" &&
-        args.reply === undefined &&
-        args.channel === undefined
-        ? { ...args, reply: rootOf(request.event) }
-        : args,
+      args,
     );
     const final = call.tool === "send" && args.final === true;
     if (final) {
