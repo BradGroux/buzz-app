@@ -41,6 +41,8 @@ import {
   type AgentIdentity,
   type AgentsNative,
   type AgentUpload,
+  type PortableAgents,
+  type PortSource,
 } from "./native";
 import {
   readRecords,
@@ -54,6 +56,7 @@ import {
 export type Agent<Config = unknown> = Readonly<{
   pubkey: string;
   name: string;
+  picture?: string;
   /** The agent type's key, `pluginId/typeId`. */
   type: string;
   owner: string;
@@ -67,6 +70,8 @@ export type Agent<Config = unknown> = Readonly<{
 }>;
 export type AgentChange<Config = unknown> = Readonly<{
   name?: string;
+  /** An HTTPS image URL; `null` or empty removes the picture. */
+  picture?: string | null;
   config?: Config;
   /** Slug to new value; `null` deletes the object. */
   attention?: Readonly<Record<string, AttentionValue | null>>;
@@ -195,6 +200,14 @@ export type Agents2 = {
    * the selected one: read the agent's conversations through this. */
   relay(pubkey: string): RelayData | undefined;
   create(input: Readonly<{ type: string; name: string }>): Promise<Agent>;
+  /** Identities earlier agent systems saved on this machine that are not
+   * Agents2 agents yet. */
+  portable(): Promise<PortableAgents>;
+  /** Takes one over as an agent of `type` in the selected community, keeping its
+   * key, name and picture. Its instructions and settings stay behind. */
+  port(
+    input: Readonly<{ source: PortSource; pubkey: string; type: string }>,
+  ): Promise<Agent>;
   save(pubkey: string, change: AgentChange): Promise<void>;
   /** Deletes its key at once. Leaving its channels and archiving it follow in
    * the background whenever its community is open. */
@@ -439,6 +452,47 @@ export class Agents2Service extends Service implements Agents2 {
   };
 
   async create({ type, name }: Readonly<{ type: string; name: string }>) {
+    if (!name.trim()) throw new Error("Name the agent");
+    return this.add(type, (native, destination, owner) =>
+      native.create(destination, owner, type, name.trim()),
+    );
+  }
+
+  async portable() {
+    const native = this.native;
+    if (!native) throw new Error("Agents run only in the desktop app");
+    const found = await native.portable();
+    const own = new Set(
+      this.identities
+        .filter((identity) => !identity.deleted)
+        .map((identity) => identity.pubkey),
+    );
+    return {
+      ...found,
+      agents: found.agents.filter((agent) => !own.has(agent.pubkey)),
+    };
+  }
+
+  async port({
+    source,
+    pubkey,
+    type,
+  }: Readonly<{ source: PortSource; pubkey: string; type: string }>) {
+    return this.add(type, (native, destination, owner) =>
+      native.port(source, pubkey, destination, owner, type),
+    );
+  }
+
+  /** Saves a new identity of `type` in the selected community with the type's
+   * default settings. */
+  private async add(
+    type: string,
+    save: (
+      native: AgentsNative,
+      destination: string,
+      owner: string,
+    ) => Promise<AgentIdentity>,
+  ) {
     const native = this.native;
     const selected = this.communities.snapshot().selected;
     const binding = selected
@@ -448,13 +502,11 @@ export class Agents2Service extends Service implements Agents2 {
     if (!native) throw new Error("Agents run only in the desktop app");
     if (!binding) throw new Error("Connect to a community first");
     if (!kind) throw new Error("That agent type is not available");
-    if (!name.trim()) throw new Error("Name the agent");
     const settings = defaults("", kind);
-    const identity = await native.create(
+    const identity = await save(
+      native,
       relayOrigin(binding.origin),
       binding.viewer,
-      type,
-      name.trim(),
     );
     const record = { ...settings, pubkey: identity.pubkey };
     try {
@@ -493,11 +545,15 @@ export class Agents2Service extends Service implements Agents2 {
         );
     }
     if (change.config !== undefined || change.attention) this.write(record);
-    if (name !== undefined && name !== identity.name) {
-      await this.native.rename(pubkey, name);
-      // Shows the new name and publishes it as the agent's profile.
-      await this.refresh();
-    }
+    const picture =
+      change.picture === undefined ? undefined : change.picture || null;
+    const renamed = name !== undefined && name !== identity.name;
+    const repictured =
+      picture !== undefined && picture !== (identity.picture ?? null);
+    if (renamed) await this.native.rename(pubkey, name);
+    if (repictured) await this.native.setPicture(pubkey, picture);
+    // Shows the new name or picture and publishes it as the agent's profile.
+    if (renamed || repictured) await this.refresh();
   }
 
   async remove(pubkey: string) {
@@ -535,6 +591,7 @@ export class Agents2Service extends Service implements Agents2 {
     return Object.freeze({
       pubkey: identity.pubkey,
       name: identity.name,
+      ...(identity.picture && { picture: identity.picture }),
       type: identity.type,
       owner: identity.owner,
       relay: identity.relay,
@@ -792,6 +849,7 @@ export class Agents2Service extends Service implements Agents2 {
       running.push(
         prior &&
           prior.name === identity.name &&
+          prior.picture === identity.picture &&
           prior.attention === record.attention &&
           prior.skipped === (record.skipped ?? EMPTY) &&
           prior.timers === (record.timers ?? EMPTY) &&

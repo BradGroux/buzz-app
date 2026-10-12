@@ -504,7 +504,10 @@ fn commands<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + Sen
         agent_control_create_prepare,
         app_agents::app_agent_list,
         app_agents::app_agent_create,
+        app_agents::app_agent_portable,
+        app_agents::app_agent_port,
         app_agents::app_agent_rename,
+        app_agents::app_agent_set_picture,
         app_agents::app_agent_delete,
         app_agents::app_agent_forget,
         app_agents::app_agent_publish,
@@ -574,11 +577,19 @@ pub fn run() {
     let instance = sign_out::Paths::resolve(&context.config().identifier).map(|paths| {
         sign_out::boot(
             &paths,
-            |registry| {
-                buzz_agent_controller::delete_local_agent_keys(
-                    registry.to_path_buf(),
-                    &buzz_agent_controller::PlatformCredentials::default(),
+            |app_data| {
+                let credentials = buzz_agent_controller::PlatformCredentials::default();
+                let old = app_data.join(sign_out::OLD_AGENTS);
+                if old
+                    .try_exists()
+                    .map_err(|error| format!("check agent registry: {error}"))?
+                {
+                    buzz_agent_controller::delete_local_agent_keys(old, &credentials)?;
+                }
+                buzz_agent_controller::AppAgents::open(
+                    app_data.join(sign_out::AGENTS).join("identities.json"),
                 )
+                .delete_keys(&credentials)
             },
             identity::remove_saved_key,
         )
@@ -672,6 +683,13 @@ pub fn run() {
                 paths
                     .as_ref()
                     .map(|(root, _, _)| root.with_file_name("agents2").join("identities.json"))
+                    .map_err(Clone::clone),
+                paths
+                    .as_ref()
+                    .map(|(root, legacy, _)| buzz_agent_controller::OldStores {
+                        harness: root.join("agents.json"),
+                        data_dir: legacy.clone(),
+                    })
                     .map_err(Clone::clone),
                 // `just desktop` builds step aside for a packaged app.
                 !tauri::is_dev(),

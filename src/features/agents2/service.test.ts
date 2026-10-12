@@ -183,8 +183,45 @@ function fakeNative(identities: AgentIdentity[] = []) {
       identities.push(identity);
       return identity;
     }),
+    portable: vi.fn(async () => ({
+      agents: [
+        { source: "harness" as const, pubkey: bot, name: "Old", relay: "" },
+        {
+          source: "installed" as const,
+          pubkey: sibling,
+          name: "Older",
+          relay: "",
+        },
+      ],
+      warnings: ["Could not read one store"],
+    })),
+    port: vi.fn(
+      async (
+        _: string,
+        pubkey: string,
+        __: string,
+        ___: string,
+        type: string,
+      ) => {
+        const identity = {
+          pubkey,
+          relay: "wss://relay.example.test",
+          owner: viewer,
+          type,
+          name: "Older",
+          deleted: false,
+        };
+        identities.push(identity);
+        return identity;
+      },
+    ),
     rename: vi.fn(async (pubkey: string, name: string) => {
       change(pubkey, { name });
+    }),
+    setPicture: vi.fn(async (pubkey: string, picture: string | null) => {
+      const index = at(pubkey);
+      const { picture: _, ...identity } = identities[index] as AgentIdentity;
+      identities[index] = picture ? { ...identity, picture } : identity;
     }),
     remove: vi.fn(async (pubkey: string) => {
       steps.push("key");
@@ -317,6 +354,40 @@ it("creates an agent in the community shown, with its type's defaults, and publi
     "watch/channel",
   ]);
   expect(service.find(bot)).toEqual(agent);
+});
+
+it("brings over an identity not already an agent, with its type's defaults, and publishes its profile", async () => {
+  const { service, native } = await setup();
+  await service.create({ type: "example/echo", name: "Echo" });
+  const found = await service.portable();
+  // `bot` is already an agent here; the warning still shows.
+  expect(found.agents.map((agent) => agent.pubkey)).toEqual([sibling]);
+  expect(found.warnings).toEqual(["Could not read one store"]);
+  const agent = await service.port({
+    source: "installed",
+    pubkey: sibling,
+    type: "example/echo",
+  });
+  expect(native.port).toHaveBeenCalledWith(
+    "installed",
+    sibling,
+    "https://relay.example.test",
+    viewer,
+    "example/echo",
+  );
+  expect(native.publishProfile).toHaveBeenCalledWith(sibling);
+  expect(agent).toMatchObject({
+    pubkey: sibling,
+    name: "Older",
+    config: { reply: "ok" },
+  });
+  expect(Object.keys(agent.attention)).toEqual([
+    "interest/default",
+    "watch/channel",
+  ]);
+  await expect(
+    service.port({ source: "harness", pubkey: bot, type: "nope/none" }),
+  ).rejects.toThrow("That agent type is not available");
 });
 
 it("delivers mentions and matching watches once, and never the agent's own events", async () => {
@@ -711,6 +782,23 @@ it("does not let one owner's agents wake each other by replying", async () => {
     ],
   });
   await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(2));
+});
+
+it("sets and clears a picture through native, and publishes it", async () => {
+  const { service, native } = await setup();
+  await service.create({ type: "example/echo", name: "Echo" });
+  native.publishProfile.mockClear();
+  const url = "https://relay.example/media/abc";
+  await service.save(bot, { picture: url });
+  expect(native.setPicture).toHaveBeenCalledWith(bot, url);
+  expect(service.find(bot)?.picture).toBe(url);
+  expect(native.publishProfile).toHaveBeenCalledWith(bot);
+  // An unchanged picture is not saved again; an empty one clears it.
+  await service.save(bot, { picture: url });
+  expect(native.setPicture).toHaveBeenCalledOnce();
+  await service.save(bot, { picture: "" });
+  expect(native.setPicture).toHaveBeenLastCalledWith(bot, null);
+  expect(service.find(bot)?.picture).toBeUndefined();
 });
 
 it("renames through native, and publishes profiles again on rename and reconnect", async () => {
