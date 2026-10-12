@@ -24,6 +24,7 @@ const agent = (name: string, n: number): Agent => ({
   type: "test/echo",
   owner: "f".repeat(64),
   relay: "wss://relay.example",
+  place: "here",
   config: { reply: `${name} says hi` },
   skipped: {},
   timers: {},
@@ -105,6 +106,7 @@ function setup(saved: Agent[], { shown = true } = {}) {
       for (const listener of listeners) listener();
       return created;
     }),
+    finish: vi.fn(async (_: string) => created),
     portable: vi.fn(async () => ({ agents: portable, warnings: [] })),
     port: vi.fn(async () => created),
     save: vi.fn(async () => {}),
@@ -132,7 +134,11 @@ function setup(saved: Agent[], { shown = true } = {}) {
     subscribe: () => () => {},
   } as unknown as RelayData;
   render(<AgentsPage agents={agents} relay={relay} />);
-  return { agents };
+  const show = (next: Agent[]) => {
+    snapshot = { ...snapshot, agents: next };
+    for (const listener of listeners) listener();
+  };
+  return { agents, types, show };
 }
 
 it("peeks at a selected agent beside the grid and follows the arrow keys", async () => {
@@ -277,6 +283,23 @@ it("brings over an earlier agent as the chosen type and drops it from the list",
   expect(within(list).getByText("Ada")).toBeInTheDocument();
 });
 
+it("brings over agents only as a type that runs here", async () => {
+  const user = userEvent.setup();
+  const { types } = setup([]);
+  types.push({
+    ...types[0],
+    key: "test/cloud",
+    title: "Cloud",
+    remote: {},
+  } as unknown as RegisteredAgentType);
+  await user.click(screen.getByRole("button", { name: "Bring over" }));
+  await screen.findByRole("button", { name: "Bring over Ada" });
+  expect(screen.getByRole("radio", { name: "Echo" })).toBeInTheDocument();
+  expect(
+    screen.queryByRole("radio", { name: "Cloud" }),
+  ).not.toBeInTheDocument();
+});
+
 it("shows why bringing an agent over failed and keeps it listed", async () => {
   const user = userEvent.setup();
   const { agents } = setup([]);
@@ -320,4 +343,62 @@ it("makes a team of chosen agents and lists it with its members", async () => {
   await user.click(screen.getByRole("button", { name: "Delete team" }));
   expect(agents.removeTeam).toHaveBeenCalledWith("team-1");
   expect(screen.getByText("No teams yet.")).toBeInTheDocument();
+});
+
+it("shows an agent on another device read-only, and offers only Finish setup and Delete for an unfinished hosted one", async () => {
+  const user = userEvent.setup();
+  const far: Agent = {
+    ...agent("Far", 3),
+    place: "elsewhere",
+    attention: {},
+  };
+  const sky: Agent = {
+    ...agent("Sky", 4),
+    place: "hosted",
+    unfinished: true,
+    attention: {},
+  };
+  const { agents } = setup([far, sky]);
+  const grid = screen.getByRole("listbox", { name: "Agents" });
+  expect(within(grid).getByText("On another device")).toBeInTheDocument();
+  expect(within(grid).getByText("Setup unfinished")).toBeInTheDocument();
+
+  await user.click(within(grid).getByText("Far"));
+  expect(screen.getByText(/another of your devices/)).toBeInTheDocument();
+  expect(
+    screen.queryByRole("button", { name: "Open" }),
+  ).not.toBeInTheDocument();
+  expect(screen.queryByText("Wakes on")).not.toBeInTheDocument();
+  await user.dblClick(within(grid).getByText("Far"));
+  expect(screen.getByRole("listbox")).toBeInTheDocument();
+
+  await user.click(within(grid).getByText("Sky"));
+  expect(
+    screen.queryByRole("button", { name: "Open" }),
+  ).not.toBeInTheDocument();
+  expect(
+    screen.getByRole("button", { name: "Delete agent" }),
+  ).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "Finish setup" }));
+  expect(agents.finish).toHaveBeenCalledWith(sky.pubkey);
+  await user.dblClick(within(grid).getByText("Sky"));
+  expect(screen.getByRole("listbox")).toBeInTheDocument();
+});
+
+it("moves focus from Finish setup to Open once the setup finishes", async () => {
+  const user = userEvent.setup();
+  const finished: Agent = {
+    ...agent("Sky", 4),
+    place: "hosted",
+    attention: {},
+  };
+  const { agents, show } = setup([{ ...finished, unfinished: true }]);
+  agents.finish.mockImplementationOnce(async () => {
+    show([finished]);
+    return finished;
+  });
+  await user.click(screen.getByText("Sky"));
+  screen.getByRole("button", { name: "Finish setup" }).focus();
+  await user.keyboard("{Enter}");
+  expect(await screen.findByRole("button", { name: "Open" })).toHaveFocus();
 });
