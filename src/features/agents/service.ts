@@ -127,6 +127,14 @@ export type AgentViewProps<Config = unknown> = {
    * hosted type's tabs save to its provider instead; for them this rejects. */
   save(config: Config): Promise<void>;
 };
+/** What a type's part of the New agent dialog receives: the new agent's
+ * starting config, from `defaults`, to fill in. The app owns its key, name and
+ * picture around it. */
+export type AgentCreateProps<Config = unknown> = {
+  config: Config;
+  onChange(config: Config): void;
+  disabled: boolean;
+};
 export type AgentTab<Config = unknown> = Readonly<{
   id: string;
   title: string;
@@ -221,6 +229,9 @@ export type AgentType<Config = unknown> = {
   summary?(agent: Agent<Config>): string;
   /** A read-only glance shown when the agent is selected in the grid. */
   Peek?: ComponentType<AgentPeekProps<Config>>;
+  /** The type's choices in the New agent dialog, such as model and
+   * instructions; the new agent starts with the config it settles on. */
+  Create?: ComponentType<AgentCreateProps<Config>>;
   /** The type's settings tabs, in order. The host adds Attention after them. */
   tabs?: readonly AgentTab<Config>[];
   /** Models and effort levels the owner can pick for the next run while
@@ -283,6 +294,28 @@ export type AgentsSnapshot = Readonly<{
 }>;
 export type { Carry, Team };
 export type TeamChange = Omit<Team, "id"> & Readonly<{ id?: string }>;
+/** What `port` imports: an identity an earlier agent system saved on this
+ * machine, or an agent a community member shared. */
+export type PortInput = Readonly<
+  | { source: PortSource; pubkey: string; type: string }
+  | {
+      source: "shared";
+      type: string;
+      name: string;
+      /** An HTTPS image URL. */
+      picture?: string;
+      instructions?: string;
+    }
+>;
+export type NewAgent = Readonly<{
+  type: string;
+  name: string;
+  /** An HTTPS image URL. */
+  picture?: string;
+  /** Its starting config, from the type's `Create`; else the type's defaults.
+   * A hosted type's settings are its provider's, so it has none here. */
+  config?: unknown;
+}>;
 export type Agents = {
   register<Config>(type: AgentType<Config>): void;
   types(): readonly RegisteredAgentType[];
@@ -296,18 +329,17 @@ export type Agents = {
   /** Makes an agent of `type` in the selected community: here, or with a
    * hosted type at its provider. A hosted one whose setup then fails is kept
    * as `unfinished`. */
-  create(input: Readonly<{ type: string; name: string }>): Promise<Agent>;
+  create(input: NewAgent): Promise<Agent>;
   /** Continues an unfinished hosted agent's setup. */
   finish(pubkey: string): Promise<Agent>;
   /** Identities earlier agent systems saved on this machine that are not
    * Agents yet. */
   portable(): Promise<PortableAgents>;
-  /** Takes one over as an agent of `type` in the selected community, keeping its
-   * key, name and picture, and whatever of its instructions and workspace the
-   * type adopts. Its other settings stay behind. */
-  port(
-    input: Readonly<{ source: PortSource; pubkey: string; type: string }>,
-  ): Promise<Agent>;
+  /** Imports one as an agent of `type` in the selected community: an identity
+   * from `portable` keeps its key, name and picture, and a shared agent gets a
+   * new key with its name and picture. Either keeps whatever of its
+   * instructions and workspace the type adopts; its other settings stay behind. */
+  port(input: PortInput): Promise<Agent>;
   save(pubkey: string, change: AgentChange): Promise<void>;
   /** Deletes its key at once. Leaving its channels and archiving it follow in
    * the background whenever its community is open. A hosted agent is archived,
@@ -726,13 +758,25 @@ export class AgentsService extends Service implements Agents {
     return value;
   };
 
-  async create({ type, name }: Readonly<{ type: string; name: string }>) {
+  async create({ type, name, picture, config }: NewAgent) {
     if (!name.trim()) throw new Error("Name the agent");
     const remote = this.types().find((entry) => entry.key === type)?.remote;
-    if (remote) return this.provision(type, remote, name.trim());
-    return this.add(type, async (native, destination, owner) => ({
-      agent: await native.create(destination, owner, type, name.trim()),
-    }));
+    if (remote) {
+      const agent = await this.provision(type, remote, name.trim());
+      if (!picture) return agent;
+      // It exists now, so a picture that fails to save does not fail it.
+      await this.save(agent.pubkey, { picture }).catch((error: unknown) =>
+        console.warn(`Agent ${agent.name} picture was not saved`, error),
+      );
+      return this.find(agent.pubkey) ?? agent;
+    }
+    return this.add(
+      type,
+      async (native, destination, owner) => ({
+        agent: await native.create(destination, owner, type, name.trim()),
+      }),
+      { config, picture },
+    );
   }
 
   /** Has the provider make the agent, then sets it up. From here on it is
@@ -811,18 +855,32 @@ export class AgentsService extends Service implements Agents {
     };
   }
 
-  async port({
-    source,
-    pubkey,
-    type,
-  }: Readonly<{ source: PortSource; pubkey: string; type: string }>) {
-    return this.add(type, (native, destination, owner) =>
-      native.port(source, pubkey, destination, owner, type),
+  async port(input: PortInput) {
+    const { type } = input;
+    if (input.source !== "shared") {
+      const { source, pubkey } = input;
+      return this.add(type, (native, destination, owner) =>
+        native.port(source, pubkey, destination, owner, type),
+      );
+    }
+    const name = input.name.trim();
+    if (!name) throw new Error("Name the agent");
+    const { picture, instructions } = input;
+    // A shared agent has no key to keep; it is a new identity that carries
+    // what was shared, as a brought-over one does.
+    return this.add(
+      type,
+      async (native, destination, owner) => ({
+        agent: await native.create(destination, owner, type, name),
+        ...(instructions?.trim() ? { carry: { instructions } } : {}),
+      }),
+      { picture },
     );
   }
 
   /** Saves a new identity of `type` in the selected community with the type's
-   * default settings, adopting what a brought-over one carried. */
+   * default settings, or the `config` it was made with, adopting what a
+   * brought-over one carried. */
   private async add(
     type: string,
     save: (
@@ -830,6 +888,7 @@ export class AgentsService extends Service implements Agents {
       destination: string,
       owner: string,
     ) => Promise<Readonly<{ agent: AgentIdentity; carry?: Carry }>>,
+    made: Readonly<{ config?: unknown; picture?: string | undefined }> = {},
   ) {
     const native = this.native;
     if (!native) throw new Error("Agents run only in the desktop app");
@@ -846,6 +905,8 @@ export class AgentsService extends Service implements Agents {
     );
     let record = { ...settings, pubkey: identity.pubkey };
     try {
+      if (made.config !== undefined)
+        record = { ...record, config: made.config };
       if (carry && kind.adopt)
         record = { ...record, config: kind.adopt(carry, record.config) };
       this.write(record);
@@ -853,8 +914,20 @@ export class AgentsService extends Service implements Agents {
       // The agent exists either way; unsaved settings start from the defaults.
       console.warn(`Agent ${identity.name} settings were not saved`, error);
     }
+    // Before the refresh, which publishes its profile with the picture. The
+    // agent exists either way; its picture can be set again later.
+    let shown = identity;
+    const { picture } = made;
+    if (picture)
+      await native.setPicture(identity.pubkey, picture).then(
+        () => {
+          shown = { ...identity, picture };
+        },
+        (error: unknown) =>
+          console.warn(`Agent ${identity.name} picture was not saved`, error),
+      );
     await this.refresh();
-    return this.view(identity, record);
+    return this.view(shown, record);
   }
 
   /** The selected community's live binding, where agents are made. */

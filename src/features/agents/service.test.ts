@@ -449,6 +449,43 @@ it("brings over an identity not already an agent, with its type's defaults and w
   ).rejects.toThrow("That agent type is not available");
 });
 
+it("imports a shared agent as a new identity with its name and picture, adopting its instructions", async () => {
+  const { service, native } = await setup();
+  const agent = await service.port({
+    source: "shared",
+    type: "example/echo",
+    name: " Baymax ",
+    picture: "https://example.test/baymax.png",
+    instructions: "Open drafts only.",
+  });
+  expect(native.create).toHaveBeenCalledWith(
+    "https://relay.example.test",
+    viewer,
+    "example/echo",
+    "Baymax",
+  );
+  expect(native.port).not.toHaveBeenCalled();
+  expect(native.setPicture).toHaveBeenCalledWith(
+    agent.pubkey,
+    "https://example.test/baymax.png",
+  );
+  expect(agent).toMatchObject({
+    name: "Baymax",
+    picture: "https://example.test/baymax.png",
+    config: { reply: "Open drafts only." },
+  });
+  // Without instructions it starts from the type's defaults.
+  const plain = await service.port({
+    source: "shared",
+    type: "example/echo",
+    name: "Plain",
+  });
+  expect(plain.config).toEqual({ reply: "ok" });
+  await expect(
+    service.port({ source: "shared", type: "example/echo", name: "  " }),
+  ).rejects.toThrow("Name the agent");
+});
+
 it("delivers mentions and matching watches once, and never the agent's own events", async () => {
   const { service, run, emit } = await setup();
   await service.create({ type: "example/echo", name: "Echo" });
@@ -1151,6 +1188,80 @@ it("saves nothing when native create fails", async () => {
   expect(storage.getItem("buzz.agents.v1")).toBeNull();
 });
 
+it("creates an agent with the config it was given, not its type's defaults, and sets its picture", async () => {
+  const storage = memoryStorage();
+  const { service, native } = await setup({ storage });
+  const picture = "https://relay.example/media/pack.png";
+  const agent = await service.create({
+    type: "example/echo",
+    name: " Echo ",
+    picture,
+    config: { reply: "chosen" },
+  });
+  expect(native.create).toHaveBeenCalledWith(
+    "https://relay.example.test",
+    viewer,
+    "example/echo",
+    "Echo",
+  );
+  expect(native.setPicture).toHaveBeenCalledExactlyOnceWith(bot, picture);
+  expect(agent).toMatchObject({ pubkey: bot, name: "Echo", picture });
+  expect(agent.config).toEqual({ reply: "chosen" });
+  expect(service.find(bot)).toMatchObject({
+    picture,
+    config: { reply: "chosen" },
+  });
+  // Everything but the config still starts from the type's defaults.
+  expect(Object.keys(service.find(bot)?.attention ?? {})).toEqual([
+    "interest/default",
+    "watch/channel",
+  ]);
+  expect(storage.getItem("buzz.agents.v1")).toContain("chosen");
+});
+
+it("keeps a new agent whose picture could not be set", async () => {
+  const { service, native } = await setup();
+  native.setPicture.mockRejectedValueOnce(new Error("Could not write"));
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  const agent = await service.create({
+    type: "example/echo",
+    name: "Echo",
+    picture: "https://relay.example/media/pack.png",
+    config: { reply: "chosen" },
+  });
+  expect(warn).toHaveBeenCalledWith(
+    expect.stringContaining("picture was not saved"),
+    expect.any(Error),
+  );
+  warn.mockRestore();
+  expect(agent).toMatchObject({
+    pubkey: bot,
+    name: "Echo",
+    config: { reply: "chosen" },
+  });
+  expect(service.find(bot)).toMatchObject({ config: { reply: "chosen" } });
+  expect(agent.picture).toBeUndefined();
+  expect(service.find(bot)?.picture).toBeUndefined();
+  expect(service.snapshot().agents.map((item) => item.pubkey)).toEqual([bot]);
+});
+
+it("sets no picture and uses the type's defaults for a new agent given neither", async () => {
+  const { service, native } = await setup();
+  const agent = await service.create({ type: "example/echo", name: "Echo" });
+  expect(native.setPicture).not.toHaveBeenCalled();
+  expect(agent.config).toEqual({ reply: "ok" });
+  expect(service.find(bot)).toMatchObject({ config: { reply: "ok" } });
+});
+
+it("refuses a blank name before making anything", async () => {
+  const { service, native } = await setup();
+  await expect(
+    service.create({ type: "example/echo", name: "   " }),
+  ).rejects.toThrow("Name the agent");
+  expect(native.create).not.toHaveBeenCalled();
+  expect(service.snapshot().agents).toEqual([]);
+});
+
 it("returns the created agent after the community changes mid-create", async () => {
   const { service, native, connect } = await setup();
   const create = native.create.getMockImplementation();
@@ -1729,6 +1840,27 @@ it("keeps a hosted agent whose setup failed, and finishes it without making anot
   expect(agent.unfinished).toBeUndefined();
   expect(records.publish).toHaveBeenCalledTimes(1);
   expect(storage.getItem("buzz.agents.unfinished.v1")).not.toContain(hostedKey);
+});
+
+it("keeps a hosted agent made without its picture when the picture fails to save", async () => {
+  const { service, plugin } = await setup();
+  const { type, remote } = cloud();
+  plugin.agents.register(type);
+  remote.profile.mockRejectedValueOnce(new Error("provider down"));
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  const agent = await service.create({
+    type: "example/cloud",
+    name: "Sky",
+    picture: "https://example.test/sky.png",
+  });
+  expect(agent).toMatchObject({ pubkey: hostedKey, place: "hosted" });
+  expect(agent.picture).toBeUndefined();
+  expect(remote.provision).toHaveBeenCalledTimes(1);
+  expect(warn).toHaveBeenCalledWith(
+    "Agent Sky picture was not saved",
+    expect.any(Error),
+  );
+  warn.mockRestore();
 });
 
 it("renames a hosted agent through its provider and relists it; its settings are the provider's", async () => {
