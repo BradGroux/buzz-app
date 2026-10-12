@@ -1,9 +1,10 @@
-// Agents2: agents that are plugins from the start. A plugin registers an agent
+// Agents: agents that are plugins from the start. A plugin registers an agent
 // type (its summary line, peek view, settings tabs and `run`); each agent made
 // from it has its own native-held key, an `agent-attention/v1` configuration the
 // app owns and edits, and a config blob the type owns. The app delivers matching live events to
 // `run` from the stream the owner already receives in the agent's community,
 // selected or not, so no plugin opens a socket or a REQ.
+import { migrateAgentStorage } from "./migrate-storage";
 import { Service, type Context } from "@deepseek-ai/cordis";
 import { npubEncode } from "nostr-tools/nip19";
 import type { ComponentType } from "react";
@@ -11,9 +12,9 @@ import {
   createContributions,
   type Contribution,
 } from "../../plugins/contributions";
-import type { LocalAgentsSnapshot } from "../agents/local";
-import { attestedOwner } from "../agents/owner-attestation";
-import { removeAgentFromChannels } from "../agents/relay-removal";
+import type { LocalAgentsSnapshot } from "./local";
+import { attestedOwner } from "./owner-attestation";
+import { removeAgentFromChannels } from "./relay-removal";
 import { communityDestination, relayOrigin } from "../communities/destination";
 import type { Communities } from "../communities/service";
 import type { RelayEvent } from "../relay/events";
@@ -42,6 +43,7 @@ import {
   nativeAgents,
   type AgentEventTemplate,
   type AgentIdentity,
+  type Carry,
   type AgentsNative,
   type AgentUpload,
   type PortableAgents,
@@ -181,6 +183,9 @@ export type AgentType<Config = unknown> = {
     config: Config;
     attention?: Readonly<Record<string, AttentionValue>>;
   }>;
+  /** A brought-over agent's config: `config` from `defaults` with whatever of
+   * `carry` the type has a place for. Without it, all of `carry` stays behind. */
+  adopt?(carry: Carry, config: Config): Config;
   /** One short line under the agent's name, e.g. its model; defaults to the title. */
   summary?(agent: Agent<Config>): string;
   /** A read-only glance shown when the agent is selected in the grid. */
@@ -207,24 +212,25 @@ export type AgentsSnapshot = Readonly<{
   teams: readonly Team[];
   error?: string;
 }>;
-export type { Team };
+export type { Carry, Team };
 export type TeamChange = Omit<Team, "id"> & Readonly<{ id?: string }>;
-export type Agents2 = {
+export type Agents = {
   register<Config>(type: AgentType<Config>): void;
   types(): readonly RegisteredAgentType[];
   snapshot(): AgentsSnapshot;
   subscribe(listener: () => void): () => void;
-  /** The agent of this pubkey in the selected community, if it is an Agents2 agent. */
+  /** The agent of this pubkey in the selected community, if it is an agent. */
   find(pubkey: string): Agent | undefined;
   /** The owner's connection to a running agent's community, which need not be
    * the selected one: read the agent's conversations through this. */
   relay(pubkey: string): RelayData | undefined;
   create(input: Readonly<{ type: string; name: string }>): Promise<Agent>;
   /** Identities earlier agent systems saved on this machine that are not
-   * Agents2 agents yet. */
+   * Agents yet. */
   portable(): Promise<PortableAgents>;
   /** Takes one over as an agent of `type` in the selected community, keeping its
-   * key, name and picture. Its instructions and settings stay behind. */
+   * key, name and picture, and whatever of its instructions and workspace the
+   * type adopts. Its other settings stay behind. */
   port(
     input: Readonly<{ source: PortSource; pubkey: string; type: string }>,
   ): Promise<Agent>;
@@ -240,7 +246,7 @@ export type Agents2 = {
 };
 declare module "@deepseek-ai/cordis" {
   interface Context {
-    agents2: Agents2;
+    agents: Agents;
   }
 }
 
@@ -355,7 +361,7 @@ async function pickFor(
   }
 }
 
-/** What Agents2 needs of the communities: the viewer, the selected one, and
+/** What Agents needs of the communities: the viewer, the selected one, and
  * a connection to any joined one without selecting it. */
 export type AgentCommunities = Pick<
   Communities,
@@ -416,7 +422,7 @@ type Runner = {
   };
 };
 
-export class Agents2Service extends Service implements Agents2 {
+export class AgentsService extends Service implements Agents {
   private readonly contributions;
   private readonly listeners = new Set<() => void>();
   /** Every saved identity, deleted ones included: native's list is the agent
@@ -442,8 +448,9 @@ export class Agents2Service extends Service implements Agents2 {
     private readonly native: AgentsNative | undefined = nativeAgents(),
     private readonly storage: Storage = globalThis.localStorage,
   ) {
-    super(ctx, "agents2");
+    super(ctx, "agents");
     this.contributions = createContributions<AgentType>(ctx);
+    migrateAgentStorage(storage);
     this.records = readRecords(storage);
     this.teamList = Object.freeze(readTeams(storage));
     this.state = Object.freeze({
@@ -558,9 +565,9 @@ export class Agents2Service extends Service implements Agents2 {
 
   async create({ type, name }: Readonly<{ type: string; name: string }>) {
     if (!name.trim()) throw new Error("Name the agent");
-    return this.add(type, (native, destination, owner) =>
-      native.create(destination, owner, type, name.trim()),
-    );
+    return this.add(type, async (native, destination, owner) => ({
+      agent: await native.create(destination, owner, type, name.trim()),
+    }));
   }
 
   async portable() {
@@ -589,14 +596,14 @@ export class Agents2Service extends Service implements Agents2 {
   }
 
   /** Saves a new identity of `type` in the selected community with the type's
-   * default settings. */
+   * default settings, adopting what a brought-over one carried. */
   private async add(
     type: string,
     save: (
       native: AgentsNative,
       destination: string,
       owner: string,
-    ) => Promise<AgentIdentity>,
+    ) => Promise<Readonly<{ agent: AgentIdentity; carry?: Carry }>>,
   ) {
     const native = this.native;
     const selected = this.communities.snapshot().selected;
@@ -608,13 +615,15 @@ export class Agents2Service extends Service implements Agents2 {
     if (!binding) throw new Error("Connect to a community first");
     if (!kind) throw new Error("That agent type is not available");
     const settings = defaults("", kind);
-    const identity = await save(
+    const { agent: identity, carry } = await save(
       native,
       relayOrigin(binding.origin),
       binding.viewer,
     );
-    const record = { ...settings, pubkey: identity.pubkey };
+    let record = { ...settings, pubkey: identity.pubkey };
     try {
+      if (carry && kind.adopt)
+        record = { ...record, config: kind.adopt(carry, record.config) };
       this.write(record);
     } catch (error) {
       // The agent exists either way; unsaved settings start from the defaults.

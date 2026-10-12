@@ -20,7 +20,7 @@ export type AgentIdentity = Readonly<{
 /** Where an earlier agent system saved an identity on this machine: this app's
  * harness agents, or the installed or development build of old Buzz. */
 export type PortSource = "harness" | "installed" | "development";
-/** An identity an earlier agent system saved, which Agents2 can take over. */
+/** An identity an earlier agent system saved, which Agents can take over. */
 export type PortableAgent = Readonly<{
   source: PortSource;
   pubkey: string;
@@ -28,6 +28,12 @@ export type PortableAgent = Readonly<{
   picture?: string;
   /** The community it was saved for there, if valid. */
   relay: string;
+}>;
+/** What an agent kept in an earlier system that its new type may adopt. */
+export type Carry = Readonly<{
+  instructions?: string;
+  /** Its working directory, absolute or `~/…`. */
+  workspace?: string;
 }>;
 export type PortableAgents = Readonly<{
   agents: readonly PortableAgent[];
@@ -61,14 +67,15 @@ export type AgentsNative = {
   ): Promise<AgentIdentity>;
   /** Earlier agent systems' identities on this machine. */
   portable(): Promise<PortableAgents>;
-  /** Takes one over with its key, name and picture, as `create` does. */
+  /** Takes one over with its key, name and picture, as `create` does, with
+   * what it kept there for its new type. */
   port(
     source: PortSource,
     pubkey: string,
     destination: string,
     owner: string,
     type: string,
-  ): Promise<AgentIdentity>;
+  ): Promise<Readonly<{ agent: AgentIdentity; carry: Carry }>>;
   rename(pubkey: string, name: string): Promise<void>;
   /** Sets its profile picture, an HTTPS image URL, or with `null` clears it. */
   setPicture(pubkey: string, picture: string | null): Promise<void>;

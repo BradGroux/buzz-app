@@ -10,7 +10,7 @@ import type { RelayData, RelaySnapshot } from "../relay/service";
 import type { RelaySession } from "../relay/session";
 import type { AgentEventTemplate, AgentIdentity, AgentsNative } from "./native";
 import {
-  Agents2Service,
+  AgentsService,
   type AgentCommunities,
   type AgentType,
   type Delivery,
@@ -23,7 +23,7 @@ import { memoryStorage } from "./test-fakes";
 // place in the order matters.
 const steps: string[] = [];
 const leaveChannels = vi.hoisted(() => vi.fn());
-vi.mock("../agents/relay-removal", () => ({
+vi.mock("./relay-removal", () => ({
   removeAgentFromChannels: leaveChannels,
 }));
 
@@ -220,7 +220,7 @@ function fakeNative(identities: AgentIdentity[] = []) {
           deleted: false,
         };
         identities.push(identity);
-        return identity;
+        return { agent: identity, carry: { instructions: "Triage." } };
       },
     ),
     rename: vi.fn(async (pubkey: string, name: string) => {
@@ -273,7 +273,7 @@ async function setup({
   const second = fakeRelay("https://other.example.test");
   const client = fakeCommunities(fake, second);
   const native = fakeNative(identities);
-  const service = new Agents2Service(ctx, client.communities, native, storage);
+  const service = new AgentsService(ctx, client.communities, native, storage);
   const plugin = ctx.extend({
     pluginOwner: Object.freeze({ id: "example", revision: "one" }),
   });
@@ -281,6 +281,7 @@ async function setup({
   const type: AgentType<Config> = {
     id: "echo",
     title: "Echo",
+    adopt: (carry, saved) => ({ reply: carry.instructions ?? saved.reply }),
     defaults: () => ({
       config: { reply: "ok" },
       attention: {
@@ -312,7 +313,7 @@ async function setup({
     }),
     run,
   };
-  plugin.agents2.register(type);
+  plugin.agents.register(type);
   await vi.waitFor(() => expect(service.snapshot().status).toBe("ready"));
   return {
     service,
@@ -377,7 +378,7 @@ it("creates an agent in the community shown, with its type's defaults, and publi
   expect(service.find(bot)).toEqual(agent);
 });
 
-it("brings over an identity not already an agent, with its type's defaults, and publishes its profile", async () => {
+it("brings over an identity not already an agent, with its type's defaults and what it adopts, and publishes its profile", async () => {
   const { service, native } = await setup();
   await service.create({ type: "example/echo", name: "Echo" });
   const found = await service.portable();
@@ -400,8 +401,9 @@ it("brings over an identity not already an agent, with its type's defaults, and 
   expect(agent).toMatchObject({
     pubkey: sibling,
     name: "Older",
-    config: { reply: "ok" },
+    config: { reply: "Triage." },
   });
+  expect(service.find(sibling)?.config).toEqual({ reply: "Triage." });
   expect(Object.keys(agent.attention)).toEqual([
     "interest/default",
     "watch/channel",
@@ -483,7 +485,7 @@ it("gives each member its teams' roster and instructions, and drops a deleted ag
       [],
     ]),
   );
-  expect(storage.getItem("buzz.agents2.teams.v1")).not.toContain(sibling);
+  expect(storage.getItem("buzz.agents.teams.v1")).not.toContain(sibling);
   await service.removeTeam(team.id);
   expect(service.snapshot().teams.map((saved) => saved.name)).toEqual(["Solo"]);
 });
@@ -808,7 +810,7 @@ it("opens no community for an agent list that arrives after it stopped", async (
       list = resolve;
     }),
   );
-  const service = new Agents2Service(
+  const service = new AgentsService(
     ctx,
     client.communities,
     native,
@@ -1045,7 +1047,7 @@ it("shows an agent whose settings could not be saved with its type's defaults", 
   const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
   await service.create({ type: "example/echo", name: "Echo" });
   warn.mockRestore();
-  expect(storage.getItem("buzz.agents2.v1") ?? "").not.toContain(bot);
+  expect(storage.getItem("buzz.agents.v1") ?? "").not.toContain(bot);
   expect(service.find(bot)).toMatchObject({ config: { reply: "ok" } });
   expect(Object.keys(service.find(bot)?.attention ?? {})).toEqual([
     "interest/default",
@@ -1053,7 +1055,7 @@ it("shows an agent whose settings could not be saved with its type's defaults", 
   ]);
   // The next save stores them.
   await service.save(bot, { config: { reply: "saved" } });
-  expect(storage.getItem("buzz.agents2.v1")).toContain(bot);
+  expect(storage.getItem("buzz.agents.v1")).toContain(bot);
 });
 
 it("saves nothing when native create fails", async () => {
@@ -1064,7 +1066,7 @@ it("saves nothing when native create fails", async () => {
     service.create({ type: "example/echo", name: "Echo" }),
   ).rejects.toThrow("Credential store refused");
   expect(service.snapshot().agents).toEqual([]);
-  expect(storage.getItem("buzz.agents2.v1")).toBeNull();
+  expect(storage.getItem("buzz.agents.v1")).toBeNull();
 });
 
 it("returns the created agent after the community changes mid-create", async () => {
@@ -1083,7 +1085,7 @@ it("returns the created agent after the community changes mid-create", async () 
 it("forgets records whose key is gone when identities load", async () => {
   const storage = memoryStorage();
   storage.setItem(
-    "buzz.agents2.v1",
+    "buzz.agents.v1",
     JSON.stringify({
       version: 1,
       agents: {
@@ -1108,7 +1110,7 @@ it("forgets records whose key is gone when identities load", async () => {
   expect(service.snapshot().agents.map((agent) => agent.name)).toEqual([
     "Echo",
   ]);
-  expect(storage.getItem("buzz.agents2.v1")).not.toContain(sibling);
+  expect(storage.getItem("buzz.agents.v1")).not.toContain(sibling);
 });
 
 it("keeps an agent created while identities are still loading", async () => {
@@ -1123,7 +1125,7 @@ it("keeps an agent created while identities are still loading", async () => {
   native.list.mockImplementationOnce(
     () => new Promise<AgentIdentity[]>((resolve) => (release = resolve)),
   );
-  const service = new Agents2Service(
+  const service = new AgentsService(
     ctx,
     fakeCommunities(fakeRelay()).communities,
     native,
@@ -1131,7 +1133,7 @@ it("keeps an agent created while identities are still loading", async () => {
   );
   ctx
     .extend({ pluginOwner: Object.freeze({ id: "example", revision: "one" }) })
-    .agents2.register<Config>({
+    .agents.register<Config>({
       id: "echo",
       title: "Echo",
       defaults: () => ({ config: { reply: "ok" } }),
@@ -1141,7 +1143,7 @@ it("keeps an agent created while identities are still loading", async () => {
   release([]);
   await vi.waitFor(() => expect(service.snapshot().status).toBe("ready"));
   expect(service.find(bot)?.name).toBe("Echo");
-  expect(storage.getItem("buzz.agents2.v1")).toContain(bot);
+  expect(storage.getItem("buzz.agents.v1")).toContain(bot);
 });
 
 it("fires a due timer once, then again an interval after it ran", async () => {
@@ -1191,7 +1193,7 @@ it("fires a due timer once, then again an interval after it ran", async () => {
   expect(run).toHaveBeenCalledTimes(2);
   // Its run state lives in the agent's record and goes when the timer does.
   const stored = () =>
-    JSON.parse(storage.getItem("buzz.agents2.v1") ?? "{}").agents[bot];
+    JSON.parse(storage.getItem("buzz.agents.v1") ?? "{}").agents[bot];
   expect(stored().timers["watch/tick"]).toMatchObject({ used: 2 });
   expect(stored().timers["watch/stale"]).toMatchObject({ used: 16 });
   await service.save(bot, { attention: { "watch/tick": null } });
@@ -1307,7 +1309,7 @@ it("deletes the key at once, then leaves its channels and archives it before for
   await service.create({ type: "example/echo", name: "Echo" });
   await service.remove(bot);
   expect(service.snapshot().agents).toEqual([]);
-  expect(storage.getItem("buzz.agents2.v1")).not.toContain(bot);
+  expect(storage.getItem("buzz.agents.v1")).not.toContain(bot);
   await vi.waitFor(() =>
     expect(steps).toEqual(["key", "channels", "archive", "forget"]),
   );

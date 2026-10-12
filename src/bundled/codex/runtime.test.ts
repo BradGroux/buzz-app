@@ -4,7 +4,7 @@ import { bytesToHex } from "nostr-tools/utils";
 import * as React from "react";
 import { apply } from "./index";
 import { afterEach, expect, it, vi } from "vitest";
-import type { Agent, Delivery } from "../../features/agents2/service";
+import type { Agent, Delivery } from "../../features/agents/service";
 import type { RelayData } from "../../features/relay/service";
 import type { EventData } from "../../features/relay/events";
 import type { HostProcessOptions } from "../../features/host/service";
@@ -277,7 +277,7 @@ function fixture(
       events.push(result.trigger.event as EventData);
     return result;
   };
-  /** Agents2's running agents, whichever community is selected. */
+  /** Agents' running agents, whichever community is selected. */
   const running = [{ ...agent, type: "buzz.codex/codex" }];
   const listeners: (() => void)[] = [];
   let runPlugin: (delivery: Delivery) => Promise<void> = (delivery) =>
@@ -289,7 +289,7 @@ function fixture(
     apply({
       react: React,
       host: { spawn },
-      agents2: {
+      agents: {
         snapshot: () => ({ status: "ready", agents: [], running }),
         relay: () => relay,
         subscribe: (listener: () => void) => {
@@ -922,7 +922,7 @@ it("ignores non-owner messages without spawning", async () => {
   expect(f.spawn).not.toHaveBeenCalled();
   expect(f.publish).not.toHaveBeenCalled();
 });
-it("answers another agent its owner attested", async () => {
+it("answers another agent its owner attested, telling the owner of failures", async () => {
   const f = fixture();
   const secret = schnorr.utils.randomSecretKey();
   const owner = bytesToHex(schnorr.getPublicKey(secret));
@@ -944,6 +944,12 @@ it("answers another agent its owner attested", async () => {
   }
   await f.runtime.run({ ...ask, agent: { ...ask.agent, owner } });
   await vi.waitFor(() => expect(f.starts()).toHaveLength(1));
+  // A failure tells the owner: tagging the sibling would wake it to fail too.
+  f.complete(0, "");
+  await vi.waitFor(() => expect(f.publish).toHaveBeenCalledTimes(1));
+  const failure = f.publish.mock.calls[0]?.[0] as { tags: string[][] };
+  expect(failure.tags).toContainEqual(["p", owner]);
+  expect(failure.tags).not.toContainEqual(["p", sibling]);
 });
 it("publishes unexpected exit and empty-completion failures instead of silently losing work", async () => {
   const f = fixture();
