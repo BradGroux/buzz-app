@@ -52,6 +52,10 @@ import {
   type AgentRecord,
   type SkippedObject,
 } from "./store";
+// STOPGAP(agent-local-typing): delete with local-typing.ts.
+import { typeLocally } from "./local-typing";
+// STOPGAP(agent-working-reactions): delete with working-reactions.ts.
+import { reactWhileWorking } from "./working-reactions";
 
 /** One of the viewer's agents, in the community at `relay`. */
 export type Agent<Config = unknown> = Readonly<{
@@ -145,6 +149,9 @@ export type Delivery<Config = unknown> = Readonly<{
   /** Aborts on the run's deadline, or when the agent is removed or its type is
    * replaced. Advisory: the handle keeps working, so finishing up is harmless. */
   signal: AbortSignal;
+  /** Keeps the run counted as working after `run` returns, until `done`
+   * settles, for a type that hands its work off and returns early. */
+  workingUntil(done: PromiseLike<unknown>): void;
 }>;
 export type Effort = Readonly<{ id: string; label: string }>;
 /** A model with its effort levels, lowest first. */
@@ -1154,6 +1161,7 @@ export class Agents2Service extends Service implements Agents2 {
         remember: (slug: string, body: string, after: number) =>
           this.require().remember(agent.pubkey, slug, body, after),
       });
+      const working = this.working(runner, job);
       try {
         await Promise.race([
           Promise.resolve().then(async () => {
@@ -1167,6 +1175,7 @@ export class Agents2Service extends Service implements Agents2 {
                 config: agent.config,
                 ...pick,
                 signal,
+                workingUntil: working.hold,
               }),
             );
           }),
@@ -1180,9 +1189,62 @@ export class Agents2Service extends Service implements Agents2 {
       } catch (error) {
         if (!lifetime.aborted)
           console.error(`Agent run failed: ${agent.name}`, error);
+      } finally {
+        working.release();
       }
     }
     runner.running = false;
+  }
+
+  /** Counts a run as working until it and everything it handed to
+   * `workingUntil` have settled, or the longest run allowed has passed. A
+   * mention run is reacted to, and shown typing here, meanwhile: both are
+   * STOPGAPs, and `done` is empty without them. */
+  private working(runner: Runner, { trigger, channelId }: Job) {
+    const native = this.native;
+    const event = trigger.type === "mention" ? trigger.event : undefined;
+    const channel =
+      event && (channelId ?? event.tags.find((tag) => tag[0] === "h")?.[1]);
+    const done =
+      native && event && channel
+        ? [
+            // STOPGAP(agent-working-reactions): delete with working-reactions.ts.
+            reactWhileWorking(
+              (template) => native.publish(runner.pubkey, template),
+              event,
+              channel,
+            ),
+            // STOPGAP(agent-local-typing): delete with local-typing.ts.
+            typeLocally(
+              () => {
+                const relay = this.relay(runner.pubkey)?.snapshot();
+                return relay?.status === "ready" ? relay.session : undefined;
+              },
+              runner.pubkey,
+              event,
+              channel,
+            ),
+          ]
+        : [];
+    let holds = 1;
+    const stop = () => {
+      if (holds < 0) return;
+      holds = -1;
+      clearTimeout(timer);
+      for (const end of done) end();
+    };
+    const timer = setTimeout(stop, TIMEOUT_LIMIT_MS);
+    const release = () => {
+      if (holds > 0 && --holds === 0) stop();
+    };
+    return {
+      hold(work: PromiseLike<unknown>) {
+        if (holds <= 0) return;
+        holds++;
+        Promise.resolve(work).then(release, release);
+      },
+      release,
+    };
   }
 
   private async claim(runner: Runner) {

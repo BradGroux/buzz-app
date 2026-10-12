@@ -230,6 +230,7 @@ function fixture(
     size: 12,
     type: mime,
   }));
+  const workingUntil = vi.fn<Delivery["workingUntil"]>();
   const agent = {
     pubkey,
     owner,
@@ -266,6 +267,7 @@ function fixture(
         instructions: "TEST_INSTRUCTIONS",
       },
       signal: new AbortController().signal,
+      workingUntil,
     };
     if (result.trigger.type !== "timer")
       events.push(result.trigger.event as EventData);
@@ -383,6 +385,7 @@ function fixture(
     read,
     storage,
     delivery,
+    workingUntil,
     starts,
     complete,
     interrupt,
@@ -701,8 +704,17 @@ it("serializes owner follow-ups and routes tool replies to the latest accepted r
   await vi.waitFor(() =>
     expect(f.sent.filter((w) => w.method === "turn/steer")).toHaveLength(2),
   );
+  // Each mention counts as working until the turn it was steered into answers.
+  let settled = 0;
+  for (const [done] of f.workingUntil.mock.calls)
+    void Promise.resolve(done).then(() => settled++);
+  expect(f.workingUntil).toHaveBeenCalledTimes(3);
+  // A macrotask lets every pending promise chain finish first.
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(settled).toBe(0);
   f.complete();
   await vi.waitFor(() => expect(f.publish).toHaveBeenCalledTimes(1));
+  await vi.waitFor(() => expect(settled).toBe(3));
   const steering = f.sent.filter((wire) => wire.method === "turn/steer");
   expect(JSON.stringify(steering[0]?.params)).toContain("FIRST_STEER");
   expect(JSON.stringify(steering[1]?.params)).toContain("SECOND_STEER");
@@ -1416,6 +1428,14 @@ it("delivers pending owner steering after a final send and posts its own answer"
   await vi.waitFor(() =>
     expect(f.sent.some((wire) => wire.method === "turn/steer")).toBe(true),
   );
+  // The prior answer settles only the first request.
+  let steered = false;
+  void Promise.resolve(f.workingUntil.mock.calls[1]?.[0]).then(() => {
+    steered = true;
+  });
+  await f.workingUntil.mock.calls[0]?.[0];
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(steered).toBe(false);
   await f.complete(0, "NEW ANSWER");
   await vi.waitFor(() =>
     expect(f.runtime.sessions(pubkey)[0]?.status).toBe("Idle"),
@@ -1439,6 +1459,9 @@ it("finishes final sends normally and preserves the agent's background terminals
   expect(f.publish).toHaveBeenCalledTimes(1);
   expect(f.runtime.sessions(pubkey)[0]?.status).toBe("Working");
   expect(f.sent.some((wire) => wire.method === "turn/interrupt")).toBe(false);
+  // The request is answered, so it stops counting as working before Codex's
+  // closing model call ends the turn.
+  await f.workingUntil.mock.calls[0]?.[0];
   const threadId = (f.starts()[0]?.params as { threadId: string } | undefined)
     ?.threadId;
   f.emit({
