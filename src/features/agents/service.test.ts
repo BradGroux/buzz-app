@@ -1740,6 +1740,75 @@ it("drops a queued watch run when attention goes off and on, or its watch is rep
   await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(3));
 });
 
+it("tells a run whose type queued its work whether that work is still current", async () => {
+  const { service, run, emit } = await setup();
+  await service.create({ type: "example/echo", name: "Echo" });
+  const watch = service.find(bot)?.attention["watch/channel"]?.value;
+  emit({ events: [event("one", { content: "deploy" })] });
+  await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(1));
+  const first = run.mock.calls[0]?.[0] as Delivery;
+  // The run returned, as a type that queues its own work does.
+  await settle();
+  expect(first.current()).toBe(true);
+  // An earlier turn tightened the watch: its event no longer matches.
+  await service.save(bot, {
+    attention: {
+      "watch/channel": { ...watch, filter: 'content == "ship"' } as never,
+    },
+  });
+  expect(first.current()).toBe(false);
+  await service.save(bot, {
+    attention: { "watch/channel": watch as never },
+  });
+  emit({ events: [event("two", { content: "deploy" })] });
+  await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(2));
+  const second = run.mock.calls[1]?.[0] as Delivery;
+  await settle();
+  expect(second.current()).toBe(true);
+  await service.save(bot, { attentionEnabled: false });
+  expect(second.current()).toBe(false);
+});
+
+it("voids a handed-off timer occurrence once attention or the timer is reset", async () => {
+  vi.useFakeTimers({ now: 1_000_000 });
+  const { service, run } = await setup();
+  await service.create({ type: "example/echo", name: "Echo" });
+  const timer = {
+    type: "timer",
+    interest_id: "default",
+    prompt: "tick",
+    enabled: true,
+    interval_secs: 60,
+    armed_at: 1_000,
+    max_occurrences: null,
+    expires_at: null,
+  } as const;
+  await service.save(bot, {
+    attention: { "watch/channel": null, "watch/tick": timer },
+  });
+  await vi.advanceTimersByTimeAsync(65_000);
+  expect(run).toHaveBeenCalledTimes(1);
+  // The run returned, as a type that hands the turn to its own queue does.
+  const first = run.mock.calls[0]?.[0] as Delivery;
+  expect(first.current()).toBe(true);
+  // Turned off and on again while the turn waits for a process.
+  await service.save(bot, { attentionEnabled: false });
+  await service.save(bot, { attentionEnabled: true });
+  expect(first.current()).toBe(false);
+  await vi.advanceTimersByTimeAsync(60_000);
+  expect(run).toHaveBeenCalledTimes(2);
+  const second = run.mock.calls[1]?.[0] as Delivery;
+  expect(second.current()).toBe(true);
+  // Disabled and rearmed while it waits: the old occurrence stays void.
+  await service.save(bot, {
+    attention: { "watch/tick": { ...timer, enabled: false } },
+  });
+  await service.save(bot, {
+    attention: { "watch/tick": { ...timer, armed_at: 1_100 } },
+  });
+  expect(second.current()).toBe(false);
+});
+
 it("runs a spent timer again when its owner restarts it", async () => {
   vi.useFakeTimers({ now: 1_000_000 });
   const { service, run } = await setup();
