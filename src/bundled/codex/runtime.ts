@@ -394,11 +394,22 @@ export class CodexRuntime {
       throw new Error(
         "Codex timers are not supported yet; use mentions or event watches.",
       );
-    if (!(await fromOwner(trigger.event, agent.owner))) {
+    const snapshot = this.relay(agent.pubkey)?.snapshot();
+    if (
+      !(await fromOwner(trigger.event, agent.owner, {
+        agent: agent.pubkey,
+        authority:
+          snapshot?.status === "ready"
+            ? snapshot.session.workflowAuthority
+            : undefined,
+        profiles:
+          snapshot?.status === "ready" ? snapshot.session.profiles : undefined,
+      }))
+    ) {
       delivery.ignored?.();
       return;
     }
-    const snapshot = this.relay(agent.pubkey)?.snapshot();
+    delivery.signal.throwIfAborted();
     if (snapshot?.status !== "ready")
       throw new Error("Connect to the agent's community first");
     const channelId = delivery.channelId;
