@@ -2419,6 +2419,7 @@ export function createRelaySession(
         catchupQueue.clear();
         dropHintConfirmations();
         requests.invalidate();
+        projects.clearHomes();
         agentLibrary.clear();
         archives.clear();
         workflows.interrupt();
@@ -2582,6 +2583,7 @@ export function createRelaySession(
         unread.clear();
         inboxFeed.clear();
         requests.invalidate();
+        projects.clearHomes();
         profiles.clear();
         emoji.clear();
         statuses.clear();
@@ -2602,6 +2604,7 @@ export function createRelaySession(
     dispose() {
       stopSidebarGroups();
       closed = true;
+      projects.clearHomes();
       typing.dispose();
       lifetime.abort();
       activity.dispose();
