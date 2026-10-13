@@ -7,6 +7,7 @@ import {
   ClaudeProcess,
   type ClaudeLaunch,
   type ClaudeModel,
+  type ActivityReceipt,
   type Settled,
   type Spawn,
   type ToolServer,
@@ -158,11 +159,16 @@ export class AgentSessions {
       steer = text,
       fresh,
       pick = {},
+      step,
+      acknowledged,
+      superseded,
+      activityScope,
     }: Readonly<{
       steer?: string;
       fresh?: () => Promise<string>;
       pick?: TurnPick;
-    }> = {},
+    }> &
+      ActivityReceipt = {},
   ): Promise<Settled> {
     if (this.disposed) return { ok: false, error: "Claude was stopped" };
     // A message that arrives while its conversation's process starts uses it.
@@ -180,7 +186,13 @@ export class AgentSessions {
     }
     if (live) {
       this.touch(key, live, seen);
-      return this.answer(key, live, live.process.busy ? steer : text, pick);
+      return this.answer(key, live, live.process.busy ? steer : text, {
+        ...pick,
+        ...(activityScope ? { activityScope } : {}),
+        ...(step ? { step } : {}),
+        ...(acknowledged ? { acknowledged } : {}),
+        ...(superseded ? { superseded } : {}),
+      });
     }
     const saved = this.options.store.get(key);
     const starting = this.start(saved?.id).catch((error) => {
@@ -196,13 +208,23 @@ export class AgentSessions {
       void live.process.kill();
       return { ok: false, error: "Claude was stopped" };
     }
-    const delivered = await this.answer(key, live, text, pick);
+    const activity = {
+      ...pick,
+      ...(activityScope ? { activityScope } : {}),
+      ...(step ? { step } : {}),
+      ...(acknowledged ? { acknowledged } : {}),
+      ...(superseded ? { superseded } : {}),
+    };
+    const delivered = await this.answer(key, live, text, activity);
     // A saved session that no longer loads starts over rather than failing
     // every message in the conversation, shown the conversation so far.
     if (!delivered.ok && saved && !live.process.started) {
       this.options.store.delete(key);
       this.drop(key, live);
-      return this.deliver(key, fresh ? await fresh() : text, seen, { pick });
+      return this.deliver(key, fresh ? await fresh() : text, seen, {
+        pick,
+        ...activity,
+      });
     }
     return delivered;
   }
@@ -260,8 +282,13 @@ export class AgentSessions {
       if (this.live.get(key) === live) this.drop(key, live);
     });
   }
-  private async answer(key: string, live: Live, text: string, pick: TurnPick) {
-    const settled = await live.process.send(text, pick);
+  private async answer(
+    key: string,
+    live: Live,
+    text: string,
+    activity: TurnPick & ActivityReceipt,
+  ) {
+    const settled = await live.process.send(text, activity);
     if (this.live.get(key) === live) {
       this.touch(key, live);
       if (live.fingerprint !== this.options.fingerprint() && !live.process.busy)
