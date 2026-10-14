@@ -1,15 +1,12 @@
 // Prompts in the harness's format (buzz-acp), so a Claude agent here reads the
 // same sections and follows the same base prompt as a harness agent.
 import { npubEncode } from "nostr-tools/nip19";
-import {
-  BUZZ_PROMPT,
-  coreMemory,
-  TOP_LEVEL_PROMPT,
-} from "../../buzz-mcp/prompt";
+import { BUZZ_PROMPT, TOP_LEVEL_PROMPT } from "../../buzz-mcp/prompt";
 import type { EventData } from "../../features/relay/events";
 import type { ClassifierSkip } from "../../features/agents/service";
+import { BASE_PROMPT } from "../../features/agent-harness/base-prompt";
+import { coreMemorySection } from "../../features/agent-harness/core-memory";
 import attentionPrompt from "./attention_prompt.md?raw";
-import basePrompt from "./base_prompt.md?raw";
 import channelModel from "./session_model_channel.md?raw";
 import threadModel from "./session_model_thread.md?raw";
 
@@ -37,7 +34,7 @@ export function systemPrompt(
 ) {
   const model = input.scope === "thread" ? threadModel : channelModel;
   const base = [
-    basePrompt,
+    BASE_PROMPT,
     BUZZ_PROMPT,
     model,
     ...(input.attention ? [attentionPrompt] : []),
@@ -55,7 +52,7 @@ export function systemPrompt(
       ? section("agent-instructions", input.instructions)
       : "",
     input.team?.trim() ?? "",
-    coreMemory(input.memory),
+    coreMemorySection(input.memory),
   ]
     .filter(Boolean)
     .join("\n\n");

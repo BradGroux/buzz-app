@@ -1,13 +1,10 @@
-import {
-  BUZZ_PROMPT,
-  coreMemory,
-  TOP_LEVEL_PROMPT,
-} from "../../buzz-mcp/prompt";
+import { BUZZ_PROMPT, TOP_LEVEL_PROMPT } from "../../buzz-mcp/prompt";
+import { BASE_PROMPT } from "../../features/agent-harness/base-prompt";
+import { coreMemorySection } from "../../features/agent-harness/core-memory";
 import type { AgentHandle } from "../../features/agents/service";
 import type { EventData } from "../../features/relay/events";
 import { threadReference } from "../../features/relay/thread-reference";
 import type { Config } from "./config";
-import basePrompt from "./base_prompt.md?raw";
 
 /** `topLevel` is an owner's Me chat: one channel conversation, posted at
  * its top level. */
@@ -28,11 +25,11 @@ export function developerInstructions(
   /** The agent's `core` memory: `null` when it has none, undefined if unread. */
   memory?: string | null,
 ) {
-  const core = coreMemory(memory);
+  const core = coreMemorySection(memory);
   return `You are ${agent.name} (pubkey ${agent.pubkey}), a coding agent in Buzz.
 The buzz namespace provides the shared Buzz tools, including messages, reactions, reads, uploads, canvas, and encrypted memory. Buzz access and signing are handled by the host. Do not invoke the buzz CLI or look for credentials. Use Codex's native coding tools in the workspace.
 
-${basePrompt.trim()}
+${BASE_PROMPT}
 
 ${BUZZ_PROMPT}
 

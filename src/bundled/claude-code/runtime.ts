@@ -5,7 +5,7 @@
 // so one agent works in several conversations at once. Claude acts in Buzz with
 // the in-process Buzz tools, signed by the agent's native-held key; the runtime
 // only reports a turn that fails.
-import type { Context, Memory } from "../../buzz-mcp/client";
+import type { Context } from "../../buzz-mcp/client";
 import { respond } from "../../buzz-mcp/rpc";
 import {
   fromOwner,
@@ -22,6 +22,7 @@ import type { RelayData } from "../../features/relay/service";
 import { threadReference } from "../../features/relay/thread-reference";
 import type { Settled, Spawn, ToolServer } from "./claude";
 import { appClient } from "../../buzz-mcp/app-client";
+import { coreOf, MemoryReads } from "../../features/agent-harness/core-memory";
 import { Lanes } from "./lanes";
 import {
   ATTENTION_REVIEW,
@@ -74,8 +75,6 @@ export type SavedConversation = Conversation & {
   at: number;
 };
 
-/** How long a read of the agent's core memory is reused. */
-const MEMORY_TTL_MS = 5 * 60_000;
 const MEMORY_TIMEOUT_MS = 5_000;
 const NAMES_TIMEOUT_MS = 2_000;
 const CHAT = [9, 40002];
@@ -92,7 +91,6 @@ type Entry = {
   attention: boolean;
   /** Watch and timer turns, one lane per Interest. */
   lanes: Lanes;
-  memory?: { value: string | null | undefined; at: number };
   /** The agent's handle from its latest delivery, for the tools to act with. */
   handle?: AgentHandle;
   /** Where each conversation's tools default to: its latest turn's thread. */
@@ -113,7 +111,7 @@ const where = ({ workspace, model }: Config) => ({
 
 export class ClaudeRuntime {
   private readonly agents = new Map<string, Entry>();
-  private readonly reading = new Map<string, Promise<readonly Memory[]>>();
+  private readonly memoryReads = new MemoryReads();
   private readonly listeners = new Set<() => void>();
   /** Each agent's last session list, kept until something changes so a view
    * reading it gets the same array back. */
@@ -372,9 +370,6 @@ export class ClaudeRuntime {
     const entry = this.entry(agent.pubkey, settings, agent.attention.enabled());
     entry.handle = agent;
     entry.team = team ?? "";
-    // Read while the turn's prompt is built, not after: a new session's prompt
-    // needs it, and a spare is only faster if nothing else is awaited.
-    void this.memory(agent.pubkey, entry);
     if (trigger.type !== "mention") {
       workingUntil(this.wake(entry, agent, trigger, current));
       return;
@@ -731,17 +726,14 @@ export class ClaudeRuntime {
       (cwd: string, attention: boolean): ToolServer =>
       async (conversation, message) => {
         const handle = entry.handle;
-        const client = handle && {
-          ...appClient(handle, {
+        const client =
+          handle &&
+          appClient(handle, {
             spawn: this.spawn,
             cwd,
-            memories: () => this.memories(pubkey),
-          }),
-          remember: async (slug: string, body: string, after: number) => {
-            await handle.remember(slug, body, after);
-            if (slug === "core") delete entry.memory;
-          },
-        };
+            memories: async () => (await this.memories(pubkey)).entries,
+            remembered: () => this.forget(pubkey),
+          });
         const context =
           (conversation && entry.contexts.get(conversation)) || {};
         return respond(client, context, message, {
@@ -767,7 +759,7 @@ export class ClaudeRuntime {
       launch: async () => {
         const { workspace, instructions, scope } = entry.config;
         const { attention } = entry;
-        const memory = await this.memory(pubkey, entry);
+        const memory = await this.core(pubkey);
         return {
           ...where(entry.config),
           tools: tools(workspace, attention),
@@ -787,63 +779,32 @@ export class ClaudeRuntime {
     return entry;
   }
 
-  /** The agent's `core` memory, as the harness injects it into a new session:
-   * its text, `null` when it has none, or undefined when it could not be read. */
-  private async memory(pubkey: string, entry: Entry) {
-    if (entry.memory && Date.now() - entry.memory.at < MEMORY_TTL_MS)
-      return entry.memory.value;
-    let value: string | null | undefined;
+  /** The agent's memory, read back through the owner's session. */
+  private memories(pubkey: string) {
+    const snapshot = this.relay(pubkey)?.snapshot();
+    if (snapshot?.status !== "ready")
+      return Promise.reject(new Error("Buzz is not connected"));
+    return this.memoryReads.read(
+      snapshot.session,
+      pubkey,
+      AbortSignal.timeout(MEMORY_TIMEOUT_MS),
+    );
+  }
+  /** The agent's `core` memory for a new session's prompt: its text, `null`
+   * when it has none, or undefined when it could not be read, so the session
+   * starts without it. */
+  private async core(pubkey: string) {
     try {
-      const memories = await this.memories(pubkey);
-      value = memories.find((memory) => memory.slug === "core")?.body ?? null;
+      return coreOf(await this.memories(pubkey));
     } catch (error) {
       console.warn("Claude could not read the agent's memory", error);
+      return undefined;
     }
-    entry.memory = { value, at: Date.now() };
-    return value;
   }
-
-  /** The agent's memory, read back through the owner's session: it is
-   * encrypted to the owner, so no agent key is needed to read it. */
-  private memories(pubkey: string): Promise<readonly Memory[]> {
-    // The owner's session holds few memory views at once, so calls share one.
-    let reading = this.reading.get(pubkey);
-    if (!reading) {
-      reading = this.readMemories(pubkey).finally(() =>
-        this.reading.delete(pubkey),
-      );
-      this.reading.set(pubkey, reading);
-    }
-    return reading;
-  }
-  private async readMemories(pubkey: string): Promise<readonly Memory[]> {
+  private forget(pubkey: string) {
     const snapshot = this.relay(pubkey)?.snapshot();
-    if (snapshot?.status !== "ready") throw new Error("Buzz is not connected");
-    const view = snapshot.session.agentMemories.open(pubkey);
-    try {
-      const done = new Promise<void>((resolve) => {
-        const settled = () =>
-          !["idle", "loading"].includes(view.snapshot().status) && resolve();
-        view.subscribe(settled);
-        settled();
-      });
-      void view.refresh();
-      await Promise.race([
-        done,
-        new Promise((_, reject) =>
-          setTimeout(
-            () => reject(new Error("Memory read timed out")),
-            MEMORY_TIMEOUT_MS,
-          ),
-        ),
-      ]);
-      const { status, listing } = view.snapshot();
-      if (status !== "ready" || !listing)
-        throw new Error(`Memory unavailable (${status})`);
-      return listing.entries;
-    } finally {
-      view.dispose();
-    }
+    if (snapshot?.status === "ready")
+      this.memoryReads.forget(snapshot.session, pubkey);
   }
 }
 
