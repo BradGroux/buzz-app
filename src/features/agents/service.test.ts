@@ -106,6 +106,13 @@ function fakeRelay(origin = "https://relay.example.test") {
       live.add(listener);
       return () => live.delete(listener);
     },
+    publishAgentPresence: vi.fn(
+      async (
+        _: "online" | "offline",
+        __: readonly string[],
+        ___: AbortSignal,
+      ) => true,
+    ),
   } as unknown as RelaySession;
   let snapshot: RelaySnapshot = {
     status: "ready",
@@ -155,6 +162,9 @@ function fakeRelay(origin = "https://relay.example.test") {
     archives,
     listed,
     session,
+    presence: session.publishAgentPresence as ReturnType<
+      typeof vi.fn<RelaySession["publishAgentPresence"]>
+    >,
     origin,
   };
 }
@@ -394,6 +404,7 @@ async function setup({
     session: fake.session,
     authorize,
     plugin,
+    presence: fake.presence,
     second,
     select: client.select,
     leave: client.leave,
@@ -3023,4 +3034,80 @@ it("stops watches and timers while attention is off, keeps every object, and res
     "watch",
     "timer",
   ]);
+});
+
+/** What each presence call said, as `status:agents`. */
+const said = (presence: { mock: { calls: unknown[][] } }) =>
+  presence.mock.calls.map(
+    ([status, agents]) => `${status}:${(agents as string[]).join(",")}`,
+  );
+
+it("says the agents it runs are online, again every minute and on a new session, and offline once removed", async () => {
+  vi.useFakeTimers();
+  const { service, presence, connect } = await setup();
+  await service.create({ type: "example/echo", name: "Echo" });
+  await vi.advanceTimersByTimeAsync(5_000);
+  expect(said(presence)).toEqual([`online:${bot}`]);
+  await vi.advanceTimersByTimeAsync(50_000);
+  expect(said(presence)).toEqual([`online:${bot}`]);
+  await vi.advanceTimersByTimeAsync(10_000);
+  expect(said(presence)).toEqual([`online:${bot}`, `online:${bot}`]);
+  connect(true);
+  await vi.advanceTimersByTimeAsync(0);
+  expect(said(presence)).toHaveLength(3);
+  await service.remove(bot);
+  await vi.advanceTimersByTimeAsync(0);
+  expect(said(presence).at(-1)).toBe(`offline:${bot}`);
+  await vi.advanceTimersByTimeAsync(120_000);
+  expect(said(presence)).toHaveLength(4);
+});
+
+it("leaves an agent another copy of the app holds to that copy, and does not say it went offline", async () => {
+  vi.useFakeTimers();
+  const { service, presence, native } = await setup();
+  native.claim.mockResolvedValue(false);
+  await service.create({ type: "example/echo", name: "Echo" });
+  await vi.advanceTimersByTimeAsync(10_000);
+  expect(said(presence)).toEqual([]);
+  native.claim.mockResolvedValue(true);
+  await vi.advanceTimersByTimeAsync(10_000);
+  expect(said(presence)).toEqual([`online:${bot}`]);
+  native.claim.mockResolvedValue(false);
+  await vi.advanceTimersByTimeAsync(120_000);
+  expect(said(presence)).toEqual([`online:${bot}`]);
+});
+
+it("tries a refused presence again after half a minute, not every tick", async () => {
+  vi.useFakeTimers();
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  const { service, presence } = await setup();
+  presence.mockRejectedValueOnce(new Error("rate-limited"));
+  await service.create({ type: "example/echo", name: "Echo" });
+  await vi.advanceTimersByTimeAsync(5_000);
+  expect(presence).toHaveBeenCalledTimes(1);
+  await vi.advanceTimersByTimeAsync(20_000);
+  expect(presence).toHaveBeenCalledTimes(1);
+  await vi.advanceTimersByTimeAsync(10_000);
+  expect(presence).toHaveBeenCalledTimes(2);
+  expect(warn).toHaveBeenCalledWith(
+    "Agent presence was not sent",
+    expect.any(Error),
+  );
+  warn.mockRestore();
+});
+
+it("stops trying presence on a session that cannot send it", async () => {
+  vi.useFakeTimers();
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  const { service, presence, connect } = await setup();
+  presence.mockResolvedValue(false);
+  await service.create({ type: "example/echo", name: "Echo" });
+  await vi.advanceTimersByTimeAsync(180_000);
+  expect(presence).toHaveBeenCalledTimes(1);
+  expect(warn).toHaveBeenCalledTimes(1);
+  presence.mockResolvedValue(true);
+  connect(true);
+  await vi.advanceTimersByTimeAsync(0);
+  expect(presence).toHaveBeenCalledTimes(2);
+  warn.mockRestore();
 });
