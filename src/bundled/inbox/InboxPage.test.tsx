@@ -3195,7 +3195,7 @@ it.each([true, false])(
       screen.getByRole("button", { name: "Open Alice in #Design" }),
     );
     const editor = await screen.findByRole("textbox", {
-      name: "Reply to thread",
+      name: sessionChannel ? "Message #Design" : "Reply to thread",
     });
     fireEvent.change(editor, { target: { value: "Respond to this" } });
     await waitFor(() =>
@@ -3218,7 +3218,10 @@ it.each([true, false])(
     const sent = h.published[0];
     if (!sent) throw Error("Missing publication");
     expect(sent.tags).toContainEqual(["h", "room"]);
-    expect(sent.tags).toContainEqual(["e", h.mention.id, "", "reply"]);
+    // A session is flat: Inbox replies continue it at the top level.
+    expect(sent.tags.some(([name]) => name === "e")).toBe(!sessionChannel);
+    if (!sessionChannel)
+      expect(sent.tags).toContainEqual(["e", h.mention.id, "", "reply"]);
     expect(sent.tags.filter(([name]) => name === "p")).toEqual(
       sessionChannel ? [["p", h.agent.pubkey]] : [],
     );
@@ -3237,7 +3240,7 @@ it("Inbox session activity with multiple agents requires an explicit recipient",
     screen.getByRole("button", { name: "Open Alice in #Design" }),
   );
   const editor = await screen.findByRole("textbox", {
-    name: "Reply to thread",
+    name: "Message #Design",
   });
   fireEvent.change(editor, { target: { value: "Choose someone first" } });
   await waitFor(() =>
@@ -3251,6 +3254,46 @@ it("Inbox session activity with multiple agents requires an explicit recipient",
   ).toBeInTheDocument();
   expect(h.published).toEqual([]);
   expect(editor).toHaveValue("Choose someone first");
+});
+
+it("Inbox keeps an open session timeline when a late reply regroups its mention", async () => {
+  const h = fixture({
+    withWriter: true,
+    sessionChannel: true,
+    memberAgents: 1,
+  });
+  render(h.view);
+  await screen.findByText("Please review this");
+  await chooseFilter("Mentions");
+  fireEvent.click(
+    screen.getByRole("button", { name: "Open Alice in #Design" }),
+  );
+  const editor = await screen.findByRole("textbox", {
+    name: "Message #Design",
+  });
+  fireEvent.change(editor, { target: { value: "Draft in progress" } });
+  act(() =>
+    h.emit([
+      message(h.alice, "room", "Threaded follow-up", 30, [
+        ["e", h.mention.id, "", "reply"],
+        ["p", h.viewer.pubkey],
+      ]),
+    ]),
+  );
+  await waitFor(() =>
+    expect(
+      h.owner.session.unread
+        .inbox()
+        .items.find((item) => item.messageIds.includes(h.mention.id))?.thread,
+    ).toBe(true),
+  );
+  await act(async () => {});
+  expect(screen.getByRole("textbox", { name: "Message #Design" })).toHaveValue(
+    "Draft in progress",
+  );
+  expect(
+    screen.queryByRole("textbox", { name: "Reply to thread" }),
+  ).not.toBeInTheDocument();
 });
 
 it.each(["preview", "name", "history"])(
