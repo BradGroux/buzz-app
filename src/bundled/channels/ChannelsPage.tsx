@@ -1198,10 +1198,12 @@ function ChannelWorkspace({
       {!cached && (
         <LiveStatus
           live={queries.live}
+          recovery={queries.recovery}
           channelId={current?.id}
           partialRoster={list.coverage === "partial"}
-          // Retry removes this control; previews have no composer.
-          onRetry={
+          // Recovery removes the focused retry control. Hand focus on
+          // explicitly; previews have no composer, so use their history.
+          onRecovered={
             current
               ? () => {
                   if (current.readOnly && !current.cached) {

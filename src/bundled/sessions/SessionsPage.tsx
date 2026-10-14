@@ -31,6 +31,7 @@ import {
   PencilSimpleIcon,
 } from "../../shared/design-system/icons";
 import { Button } from "../../shared/design-system/ui/Button";
+import { useRecoveryShown } from "../../features/relay/RecoveryNotice";
 import { ChatCircleIcon } from "../../shared/design-system/icons/index";
 import {
   useCallback,
@@ -221,12 +222,7 @@ function LiveSessions({
     <PanelFrame companion={companion}>
       <section className={styles.empty}>
         {placement.status !== "ready" ? (
-          <div role="status">
-            <p>{placement.error ?? "Loading Me placement…"}</p>
-            <Button onClick={() => void session.mePlacement.refresh()}>
-              Retry Me
-            </Button>
-          </div>
+          <p role="status">{placement.error ?? "Loading Me placement…"}</p>
         ) : list.status === "loading" ? (
           <p role="status">Loading your conversation…</p>
         ) : (
@@ -288,6 +284,7 @@ function SessionWork({
   navigator?: Navigation | undefined;
 }) {
   const window = useChannelWindow(session.channels, channel.id);
+  const recoveryShown = useRecoveryShown(session.recovery);
   const [sent, setSent] = useState<string>();
   const [renameOpen, setRenameOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -494,12 +491,7 @@ function SessionWork({
             />
           )}
           {placement.status !== "ready" && (
-            <div role="status">
-              <p>{placement.error ?? "Loading Me placement…"}</p>
-              <Button onClick={() => void session.mePlacement.refresh()}>
-                Retry Me
-              </Button>
-            </div>
+            <p role="status">{placement.error ?? "Loading Me placement…"}</p>
           )}
           {!inMe && placement.status === "ready" && (
             <div role="status">
@@ -516,7 +508,9 @@ function SessionWork({
           <SessionColumn enabled={false}>
             <MessageManagementStatus />
             <div className={styles.timeline}>
-              {window.status === "error" && !window.rows.length ? (
+              {window.status === "error" &&
+              !window.rows.length &&
+              !recoveryShown ? (
                 <div className={styles.empty} role="alert">
                   <p>{window.error}</p>
                   <Button
