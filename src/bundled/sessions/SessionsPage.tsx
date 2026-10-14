@@ -1,5 +1,5 @@
+import { profileActivityViewTarget } from "../../features/profiles/target";
 import { useChannelNavigation } from "../../features/channel-navigation/ChannelNavigationState";
-import { activityTarget } from "../../features/agents/activity-target";
 import { useConversationTabs } from "../channels/useConversationTabs";
 import { useChannelTabState } from "../channels/useChannelTabState";
 import { useChannelLabels } from "../channels/useChannelLabels";
@@ -66,6 +66,7 @@ import {
 import { ChannelTimeline } from "../../features/messages/ChannelTimeline";
 import { rejectUnhandledFileDrop } from "../../features/messages/use-file-drop";
 import { MessageComposer } from "../../features/messages/MessageComposer";
+import type { MessageLinkOrigin } from "../../features/messages/MessageRow";
 import { NewSessionComposer } from "../../features/sessions/NewSessionComposer";
 import { SessionAgentControl } from "../../features/sessions/SessionAgentControl";
 import { SessionProjectControl } from "../../features/sessions/SessionProjectControl";
@@ -345,9 +346,9 @@ function SessionWork({
       navigation?.signal.aborted
     )
       return;
-    const target = activityTarget(intent.agent, intent.channelId);
-    const panel = panels.resolve(target);
-    if (panel) {
+    const target = profileActivityViewTarget(intent.agent);
+    const panel = target && panels.resolve(target);
+    if (target && panel) {
       panelTrigger.current = intent.trigger;
       open({ channelId: intent.channelId, panel, target }, true);
     }
@@ -357,7 +358,7 @@ function SessionWork({
   const canOpenLink = (url: string) =>
     !!panels.resolve(url) ||
     (!!navigator && !!sessionLinkTarget(url, scope, session.viewer));
-  function openLink(url: string) {
+  function openLink(url: string, origin?: MessageLinkOrigin) {
     const connection = relay.snapshot();
     if (
       !mounted.current ||
@@ -378,7 +379,12 @@ function SessionWork({
       document.activeElement instanceof HTMLElement
         ? document.activeElement
         : null;
-    secondary.open({ channelId: channel.id, panel, target: url });
+    secondary.open({
+      channelId: channel.id,
+      ...(origin && { rootId: origin.rootId }),
+      panel,
+      target: url,
+    });
     return true;
   }
   useEffect(
