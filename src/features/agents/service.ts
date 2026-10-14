@@ -106,8 +106,8 @@ import {
   type Team,
   type Unfinished,
 } from "./store";
-// STOPGAP(agent-local-typing): delete with local-typing.ts.
-import { typeLocally } from "./local-typing";
+import { meChat } from "./me-chat";
+import { type Pulses, pulseTyping } from "./typing";
 
 /** Where an agent runs: `here`, with its key on this device; `hosted`, by its
  * type's provider; or `elsewhere`, on another of the owner's devices. Only an
@@ -791,6 +791,8 @@ type Runner = {
   readonly wrote: Set<string>;
   /** Turns still counted as working, which a change of type waits out. */
   working: number;
+  /** Its typing pulses, one per conversation it is working in. */
+  readonly typing: Pulses;
   /** A provider/config transition owns the idle runner and pauses its queue. */
   transitioning: boolean;
   /** Whether native may hold the agent for this copy; true at first, since
@@ -2118,6 +2120,7 @@ export class AgentsService extends Service implements Agents {
       seen: new Set(),
       wrote: new Set(),
       working: 0,
+      typing: new Map(),
       transitioning: false,
       mayHold: true,
       epoch: 0,
@@ -2428,7 +2431,7 @@ export class AgentsService extends Service implements Agents {
           this.require().remember(agent.pubkey, slug, body, after),
         attention: this.attention(agent.pubkey),
       });
-      const working = this.working(runner, job);
+      const working = this.working(runner, job, agent.owner);
       const completion = Promise.resolve().then(async () => {
         const pick = await pickFor(job.trigger, agent, type);
         const team = teamPrompt(
@@ -2481,28 +2484,36 @@ export class AgentsService extends Service implements Agents {
 
   /** Counts a run as working until it and everything it handed to
    * `workingUntil` have settled, however long that takes. A
-   * mention run is shown typing on this device meanwhile; no public
-   * activity is published. */
-  private working(runner: Runner, { trigger, channelId, work }: Job) {
+   * mention run is shown typing in its thread meanwhile, from its first
+   * `workingUntil`: a runtime that ignores the mention never shows it. Its
+   * activity stays on this device. */
+  private working(
+    runner: Runner,
+    { trigger, channelId, work }: Job,
+    owner: string,
+  ) {
     work?.started();
     const event = trigger.type === "mention" ? trigger.event : undefined;
     const channel =
       event && (channelId ?? event.tags.find((tag) => tag[0] === "h")?.[1]);
-    const done =
-      event && channel
-        ? [
-            // STOPGAP(agent-local-typing): delete with local-typing.ts.
-            typeLocally(
-              () => {
-                const relay = this.relay(runner.pubkey)?.snapshot();
-                return relay?.status === "ready" ? relay.session : undefined;
-              },
-              runner.pubkey,
-              event,
-              channel,
-            ),
-          ]
-        : [];
+    let typing: (() => void) | undefined;
+    const beginTyping = () => {
+      if (typing || !event || !channel) return;
+      typing = pulseTyping(
+        // Straight to native, so pulses stay out of what it wrote.
+        async (pulse) => this.require().publish(runner.pubkey, pulse),
+        // Where its turn answers, read the same way.
+        meChat(
+          () => this.relay(runner.pubkey),
+          owner,
+          channel,
+          runner.controller.signal,
+        ),
+        event,
+        channel,
+        runner.typing,
+      );
+    };
     let holds = 1;
     let outcome: WorkOutcome = { ok: true };
     const lifetime = runner.controller.signal;
@@ -2512,7 +2523,7 @@ export class AgentsService extends Service implements Agents {
       holds = -1;
       lifetime.removeEventListener("abort", abort);
       runner.working--;
-      for (const end of done) end();
+      typing?.();
     };
     const abort = () => {
       work?.remove();
@@ -2544,6 +2555,7 @@ export class AgentsService extends Service implements Agents {
       hold(pending: PromiseLike<unknown>) {
         if (holds <= 0) return;
         holds++;
+        beginTyping();
         Promise.resolve(pending).then(release, (error) =>
           release({ ok: false, error: message(error) }),
         );
