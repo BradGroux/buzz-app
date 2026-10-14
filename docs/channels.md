@@ -1123,6 +1123,17 @@ Read-only connections keep the existing composer capability notice; missing/revo
 roots do not expose a composer. Exact navigation can retain and focus a selected
 reply beyond the traversal range; it does not extend that range or promise complete history.
 
+A labelled divider separates the original message from replies only while at
+least one reply is displayed. With no displayed replies, including while loading,
+it is hidden even if a summary total is known. It shows the relay's thread summary
+total, the same count as the channel's reply link, including collapsed descendants. Without a positive summary total it says
+“Replies”, never inferring that history is empty from the loaded rows or reader
+state. Summary counts can briefly lag a just-sent reply, matching the channel link.
+The first reply always shows its author, even when it matches the original.
+The original has no day divider above it; its byline already names the day.
+Agent-addressed messages retain their date when expanded.
+Replies show a day divider only when their day differs from the previous row.
+
 Ordinary replies remain flat beneath the root. Replies to those replies form nested
 lists, with ascending timestamp/event-ID order among siblings. Nested branches start
 closed and expand one level at a time; once opened, they stay open for the lifetime

@@ -1148,6 +1148,9 @@ function AgentsMessageRow(props: MessageRowProps) {
         </button>
         {open && (
           <div className={styles.audienceBody}>
+            <div className="text-caption">
+              <MessageTimestamp createdAt={row.createdAt} />
+            </div>
             <FullMessageRow
               {...props}
               shownRow={body}
