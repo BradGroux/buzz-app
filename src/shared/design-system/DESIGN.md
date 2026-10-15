@@ -1128,6 +1128,7 @@ they apply. Keep the same control recognizable across those states.
 
 - Pressed changes the fill without moving the control.
 - Loading preserves the label’s space and blocks repeated activation in behavior, not just CSS.
+- For non-blocking background checks, delay progress feedback for about one second to avoid flicker. User-triggered actions such as Save still show immediate loading feedback.
 - Hover adds contrast appropriate to the surface: a light row darkens, while a dark chip may lighten.
 - Selection remains visible after the pointer leaves. A selected toggle-group item does nothing when selected again and has no hover treatment.
 - Disabled means unavailable. Do not use it as a quieter text-emphasis level.
