@@ -1,8 +1,9 @@
-// Turns Agents deliveries into goose turns. Each agent of this type has its
-// own `goose-acp` process; a delivery becomes a prompt in the harness format,
-// sent to the ACP session for its conversation; a watch or timer wake runs as
-// a one-off turn in a new session, in its Interest's lane. The run returns once
-// the turn is handed over, so one agent works in several conversations at once.
+// Turns Agents deliveries into goose turns. Every agent of this type shares
+// one `goose-acp` process; a delivery becomes a prompt in the harness format,
+// sent to the agent's ACP session for its conversation; a watch or timer wake
+// runs as a one-off turn in a new session, in its Interest's lane. The run
+// returns once the turn is handed over, so one agent works in several
+// conversations at once.
 // goose acts in Buzz with the in-process Buzz tools over loopback HTTP MCP,
 // signed by the agent's native-held key; the runtime only reports a turn that
 // fails.
@@ -31,10 +32,11 @@ import {
   turnPrompt,
 } from "../claude-code/prompt";
 import type { ServeMcp, Spawn, ToolServer } from "./goose";
-import { AgentSessions, ServerPool } from "./sessions";
+import { AgentSessions, ServerPool, SharedProcess } from "./sessions";
 
 export type Config = Readonly<{
-  /** A model the provider offers; empty uses the goose config's. */
+  /** A model the provider offers; empty uses the provider's default, or the
+   * goose config's when no provider is named. */
   model: string;
   /** A goose provider; empty uses the goose config's. */
   provider: string;
@@ -98,17 +100,15 @@ type Entry = {
   contexts: Map<string, Context>;
 };
 
-/** The environment that picks the agent's model and provider over the goose
- * config's. */
-const env = ({ model, provider }: Config) => ({
-  ...(model.trim() ? { GOOSE_MODEL: model.trim() } : {}),
-  ...(provider.trim() ? { GOOSE_PROVIDER: provider.trim() } : {}),
-});
-
 export class GooseRuntime {
   private readonly agents = new Map<string, Entry>();
   /** The MCP servers every agent's sessions share. */
   private readonly pool = new ServerPool();
+  /** The goose every agent's sessions open in. */
+  private readonly goose = new SharedProcess(
+    (id, options) => this.spawn(id, options),
+    (handler) => this.serve(handler),
+  );
   private readonly reading = new Map<string, Promise<readonly Memory[]>>();
   private readonly listeners = new Set<() => void>();
   private readonly views = new Map<
@@ -134,7 +134,8 @@ export class GooseRuntime {
   }
 
   /** Brings the runtime in line with this type's agents: changed settings
-   * reopen idle sessions, and removed agents stop. */
+   * reopen idle sessions, and removed agents stop. goose stops with the
+   * last. */
   sync(agents: readonly Agent[]) {
     const current = new Set(agents.map((agent) => agent.pubkey));
     for (const [pubkey, entry] of this.agents)
@@ -142,6 +143,7 @@ export class GooseRuntime {
         entry.sessions.dispose();
         this.agents.delete(pubkey);
       }
+    if (!this.agents.size) this.goose.stop();
     for (const agent of agents) {
       const next = config(agent.config);
       const entry = this.agents.get(agent.pubkey);
@@ -181,6 +183,7 @@ export class GooseRuntime {
   dispose() {
     for (const entry of this.agents.values()) entry.sessions.dispose();
     this.agents.clear();
+    this.goose.stop();
   }
 
   async run({
@@ -189,6 +192,7 @@ export class GooseRuntime {
     config: raw,
     channelId,
     team,
+    model,
     workingUntil,
     ignored,
     signal,
@@ -273,6 +277,7 @@ export class GooseRuntime {
       fresh: async () => (await prompt(true)).text,
       title: sessionTitle(entry.name, place, key.split("/")[1]),
       signal,
+      ...(model ? { model } : {}),
       activityScope: topLevel
         ? channel
         : (threadReference(event)?.rootId ?? event.id),
@@ -468,7 +473,7 @@ export class GooseRuntime {
       sessions: undefined as unknown as AgentSessions,
       contexts: new Map(),
     };
-    // One process serves every session, so the tools read the settings, the
+    // Every session of the agent shares them, so they read the settings, the
     // handle and the conversation's place as they are when called.
     const tools: ToolServer = async (conversation, message) => {
       const handle = entry.handle;
@@ -489,15 +494,14 @@ export class GooseRuntime {
     entry.sessions = new AgentSessions({
       spawn: (id, options) => this.spawn(id, options),
       tools,
-      serve: (handler) => this.serve(handler),
+      process: this.goose,
       pool: this.pool,
       onChange: () => this.notify(),
-      processFingerprint: () =>
-        JSON.stringify([
-          entry.config.workspace,
-          entry.config.model,
-          entry.config.provider,
-        ]),
+      // Read as each turn starts, so a change needs no restart.
+      choice: () => ({
+        provider: entry.config.provider.trim(),
+        model: entry.config.model.trim(),
+      }),
       fingerprint: () =>
         JSON.stringify([
           entry.config.workspace,
@@ -511,7 +515,6 @@ export class GooseRuntime {
         const memory = await this.memory(pubkey, entry);
         return {
           workspace,
-          env: env(entry.config),
           systemPrompt: systemPrompt({
             scope,
             cwd: workspace,
