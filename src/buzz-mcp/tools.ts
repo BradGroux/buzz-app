@@ -128,6 +128,14 @@ export const TOOLS: readonly Tool[] = [
   tool("media_get", "See an image from a Buzz media URL.", { url: str }, [
     "url",
   ]),
+  tool(
+    "tabs",
+    "Your owner's open tabs for this channel's threads, or open or close a thread's tab. Opening never takes their focus.",
+    {
+      action: { type: "string", enum: ["open", "close"] },
+      thread: str,
+    },
+  ),
 ];
 
 /** Message kinds as the CLI reads them. */
@@ -577,6 +585,41 @@ const HANDLERS: Readonly<Record<string, Handler>> = {
     if (!type?.startsWith("image/"))
       throw new Error("Only JPEG, PNG, GIF and WebP images can be shown.");
     return { data, type };
+  },
+
+  async tabs(tools, args) {
+    const { client, context } = tools;
+    const tabs = client.tabs;
+    if (!tabs)
+      throw new Error(
+        "Tabs are kept in Buzz Desktop and are unavailable here.",
+      );
+    // Only the channel the agent works in, so it never pulls the owner
+    // toward another conversation.
+    const channel = context.channel;
+    if (!channel) throw new Error("Tabs need a channel to work in.");
+    if (args.action === undefined) {
+      const open = tabs.list(channel);
+      return open.length
+        ? open
+            .map(
+              (tab) => `${tab.root} ${tab.pane}${tab.shown ? " (shown)" : ""}`,
+            )
+            .join("\n")
+        : "No thread tabs open.";
+    }
+    if (args.action !== "open" && args.action !== "close")
+      throw new Error("action must be open or close.");
+    const event = await tools.event(required(args, "thread"));
+    if (tag(event, "h") !== channel)
+      throw new Error(`${event.id} is not in this channel.`);
+    const root = rootOf(event);
+    if (args.action === "open")
+      return tabs.open(channel, root) ? `opened ${root}` : "already open";
+    const closed = tabs.close(channel, root);
+    if (closed === "shown")
+      throw new Error("Your owner is looking at that tab, so it stays open.");
+    return closed === "closed" ? "closed" : "not open";
   },
 };
 
