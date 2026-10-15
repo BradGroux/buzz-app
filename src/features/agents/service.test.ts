@@ -68,7 +68,29 @@ const event = (id: string, patch: Partial<RelayEvent> = {}) =>
 
 function fakeRelay(origin = "https://relay.example.test") {
   const live = new Set<LiveListener>();
+  /** Listeners that asked for replayed history too. */
+  const replays = new Set<LiveListener>();
   const changes = new Set<() => void>();
+  const rosterChanges = new Set<() => void>();
+  // The agent is in `channel`, `dm` and `groupDm`; `private` is the owner's
+  // alone, and `dm-others` and `dm-unknown` are DMs it is not known to be in
+  // (discovery emits an empty roster, never a missing one). `saved` has only a
+  // roster loaded from disk, not yet confirmed by the relay.
+  const rows: {
+    id: string;
+    name?: string;
+    channelType?: "dm";
+    members: string[];
+    cached?: true;
+  }[] = [
+    { id: channel, name: "general", members: [viewer, bot] },
+    { id: "private", name: "private", members: [viewer] },
+    { id: dm, channelType: "dm", members: [viewer, bot] },
+    { id: groupDm, channelType: "dm", members: [viewer, other, bot] },
+    { id: "dm-others", channelType: "dm", members: [viewer, other] },
+    { id: "dm-unknown", channelType: "dm", members: [] },
+    { id: "saved", name: "saved", members: [viewer, bot], cached: true },
+  ];
   const archived = new Set<string>();
   const archives = {
     archived,
@@ -97,20 +119,12 @@ function fakeRelay(origin = "https://relay.example.test") {
     archives,
     read: vi.fn(async () => [...listed]),
     mePlacement: { snapshot: () => ({ status: "ready" }), has: () => false },
-    // The agent is in `channel`, `dm` and `groupDm`; `private` is the owner's
-    // alone, and `dm-others` and `dm-unknown` are DMs it is not known to be in
-    // (discovery emits an empty roster, never a missing one).
     channels: {
-      list: () => ({
-        channels: [
-          { id: channel, name: "general", members: [viewer, bot] },
-          { id: "private", name: "private", members: [viewer] },
-          { id: dm, channelType: "dm", members: [viewer, bot] },
-          { id: groupDm, channelType: "dm", members: [viewer, other, bot] },
-          { id: "dm-others", channelType: "dm", members: [viewer, other] },
-          { id: "dm-unknown", channelType: "dm", members: [] },
-        ],
-      }),
+      list: () => ({ channels: rows.map((row) => ({ ...row })) }),
+      subscribeList(listener: () => void) {
+        rosterChanges.add(listener);
+        return () => rosterChanges.delete(listener);
+      },
     },
     live: {
       snapshot: () => ({ status }),
@@ -119,9 +133,10 @@ function fakeRelay(origin = "https://relay.example.test") {
         return () => statuses.delete(listener);
       },
     },
-    subscribeLive(listener: LiveListener) {
-      live.add(listener);
-      return () => live.delete(listener);
+    subscribeLive(listener: LiveListener, options?: { replay?: boolean }) {
+      const listeners = options?.replay ? replays : live;
+      listeners.add(listener);
+      return () => listeners.delete(listener);
     },
     publishAgentPresence: vi.fn(
       async (
@@ -184,7 +199,14 @@ function fakeRelay(origin = "https://relay.example.test") {
       }
     },
     emit: (batch: LiveBatch) => {
-      for (const listener of live) listener(batch);
+      for (const listener of batch.replay ? replays : [...live, ...replays])
+        listener(batch);
+    },
+    /** The relay confirms channel `id`'s roster, with these members. */
+    confirm(id: string, members: string[]) {
+      const index = rows.findIndex((row) => row.id === id);
+      rows[index] = { id, name: id, members };
+      for (const listener of rosterChanges) listener();
     },
     archives,
     listed,
@@ -429,6 +451,7 @@ async function setup({
     storage,
     run,
     emit: fake.emit,
+    confirm: fake.confirm,
     connect: fake.connect,
     signIn: fake.signIn,
     fail: fake.fail,
@@ -2979,6 +3002,191 @@ it("keeps encrypted DMs and reactions to its own messages away from watches", as
     slug: "watch/everything",
     event: { id: "note".padEnd(64, "0") },
   });
+});
+
+const everything = {
+  "watch/everything": {
+    type: "event",
+    interest_id: "default",
+    enabled: true,
+    since: 1,
+    channels: "all",
+    kinds: [],
+  },
+} as const;
+const woke = (run: { mock: { calls: readonly (readonly unknown[])[] } }) =>
+  run.mock.calls.map(([input]) =>
+    (input as { trigger: { event: RelayEvent } }).trigger.event.id.replace(
+      /0+$/,
+      "",
+    ),
+  );
+
+it("delivers what a reconnect replays since the agent started listening, once", async () => {
+  const { service, run, emit } = await setup();
+  await service.create({ type: "example/echo", name: "Echo" });
+  await service.save(bot, { attentionEnabled: true, attention: everything });
+  const now = Math.floor(Date.now() / 1000);
+  emit({ events: [event("live", { created_at: now })] });
+  await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(1));
+  // The subscription comes back and sends its recent history again: the one
+  // already heard, one missed while it was down, and one from before.
+  emit({
+    replay: true,
+    events: [
+      event("live", { created_at: now }),
+      event("missed", { created_at: now + 1 }),
+      event("before", { created_at: now - 600 }),
+    ],
+  });
+  await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(2));
+  await settle();
+  expect(woke(run)).toEqual(["live", "missed"]);
+});
+
+it("still knows a quiet channel's event when a reconnect replays it after busy traffic elsewhere", async () => {
+  const { service, run, emit } = await setup();
+  await service.create({ type: "example/echo", name: "Echo" });
+  await service.save(bot, { attentionEnabled: true, attention: everything });
+  const now = Math.floor(Date.now() / 1000);
+  emit({ events: [event("quiet", { created_at: now })] });
+  await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(1));
+  // More events than the shared seen set holds, all in another channel.
+  emit({
+    events: Array.from({ length: 2_100 }, (_, index) =>
+      event(`busy${index}x`, { created_at: now, tags: [["h", "private"]] }),
+    ),
+  });
+  emit({ replay: true, events: [event("quiet", { created_at: now })] });
+  // A later event runs after anything the replay queued.
+  emit({ events: [event("after", { created_at: now })] });
+  await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(2));
+  await settle();
+  expect(woke(run)).toEqual(["quiet", "after"]);
+});
+
+it("delivers a replay of more matching events than the rate limit takes at once, each once", async () => {
+  vi.useFakeTimers({ now: 1_000_000_000 });
+  try {
+    const { service, run, emit } = await setup();
+    await service.create({ type: "example/echo", name: "Echo" });
+    await service.save(bot, { attentionEnabled: true, attention: everything });
+    const now = Math.floor(Date.now() / 1000);
+    const ids = Array.from({ length: 80 }, (_, index) => `m${index}x`);
+    // A three-minute drop: live, these would have spread over three windows.
+    emit({
+      replay: true,
+      events: ids.map((id, index) =>
+        event(id, { created_at: now + 1 + Math.floor(index / 30) }),
+      ),
+    });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(run.mock.calls.length).toBeLessThanOrEqual(60);
+    expect(run.mock.calls.length).toBeGreaterThan(0);
+    // The rest wait for the next rate window, and a second replay of the
+    // same history wakes nothing again.
+    emit({
+      replay: true,
+      events: ids.map((id) => event(id, { created_at: now + 1 })),
+    });
+    await vi.advanceTimersByTimeAsync(70_000);
+    expect(woke(run).sort()).toEqual(
+      ids.map((id) => id.replace(/0+$/, "")).sort(),
+    );
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("leaves a replay past its backlog unseen, so a later replay delivers it", async () => {
+  vi.useFakeTimers({ now: 1_000_000_000 });
+  try {
+    const { service, run, emit } = await setup();
+    await service.create({ type: "example/echo", name: "Echo" });
+    await service.save(bot, { attentionEnabled: true, attention: everything });
+    const now = Math.floor(Date.now() / 1000);
+    const ids = Array.from({ length: 520 }, (_, index) => `b${index}x`);
+    const replay = () =>
+      emit({
+        replay: true,
+        events: ids.map((id) => event(id, { created_at: now + 1 })),
+      });
+    replay();
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    expect(run.mock.calls.length).toBe(512);
+    replay();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(new Set(woke(run)).size).toBe(520);
+    expect(run.mock.calls.length).toBe(520);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("holds a watched event until the relay confirms its channel's saved roster", async () => {
+  const { service, run, emit, confirm } = await setup();
+  await service.create({ type: "example/echo", name: "Echo" });
+  await service.save(bot, { attentionEnabled: true, attention: everything });
+  emit({
+    events: [
+      event("kept", { tags: [["h", "saved"]] }),
+      event("dropped", { tags: [["h", "saved"]] }),
+    ],
+  });
+  await settle();
+  expect(run).not.toHaveBeenCalled();
+  // Confirmed with the agent still in it: both wake it, each once.
+  confirm("saved", [viewer, bot]);
+  await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(2));
+  confirm("saved", [viewer, bot]);
+  await settle();
+  expect(woke(run)).toEqual(["kept", "dropped"]);
+});
+
+it("delivers a held replay of more events than the agent takes at once when its roster is confirmed", async () => {
+  vi.useFakeTimers({ now: 1_000_000_000 });
+  try {
+    const { service, run, emit, confirm } = await setup();
+    await service.create({ type: "example/echo", name: "Echo" });
+    await service.save(bot, { attentionEnabled: true, attention: everything });
+    const now = Math.floor(Date.now() / 1000);
+    const ids = Array.from({ length: 80 }, (_, index) => `h${index}x`);
+    const replay = () =>
+      emit({
+        replay: true,
+        events: ids.map((id) =>
+          event(id, { created_at: now + 1, tags: [["h", "saved"]] }),
+        ),
+      });
+    replay();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(run).not.toHaveBeenCalled();
+    // More than the queue takes at once: the rest wait for room.
+    confirm("saved", [viewer, bot]);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(run.mock.calls.length).toBeGreaterThan(0);
+    expect(run.mock.calls.length).toBeLessThan(80);
+    await vi.advanceTimersByTimeAsync(2 * 60_000);
+    replay();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(woke(run).sort()).toEqual(
+      ids.map((id) => id.replace(/0+$/, "")).sort(),
+    );
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("drops a held event when the confirmed roster no longer has the agent", async () => {
+  const { service, run, emit, confirm } = await setup();
+  await service.create({ type: "example/echo", name: "Echo" });
+  await service.save(bot, { attentionEnabled: true, attention: everything });
+  emit({ events: [event("removed", { tags: [["h", "saved"]] })] });
+  await settle();
+  confirm("saved", [viewer]);
+  confirm("saved", [viewer, bot]);
+  await settle();
+  expect(run).not.toHaveBeenCalled();
 });
 
 it("wakes a watch only for channels the agent is in, even when it watches all", async () => {

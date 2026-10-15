@@ -18,6 +18,7 @@ import { wake } from "../agent-harness/wakes";
 import { STANDALONE_DEADLINE_MS } from "../agent-harness/standalone";
 import { EFFORT_TAG, MODEL_TAG } from "../relay/messages";
 import type { LiveBatch } from "../relay/incoming";
+import { LIVE_REPLAY_LIMIT } from "../relay/live";
 import {
   addressedTo,
   CHAT_KINDS,
@@ -57,6 +58,17 @@ import { type Pulses, pulseTyping } from "./typing";
 const QUEUE_LIMIT = 32;
 /** The spec asks for at least the agent's 2,048 most recent events. */
 const SEEN_LIMIT = 2_048;
+/** Watched events each agent keeps while their channel's roster is only the one
+ * saved on disk, until the relay confirms it. */
+const HELD_LIMIT = 256;
+/** Replayed events each agent keeps until it has room for them. A replay sends
+ * minutes of traffic at once, which the queue and rate limit would otherwise
+ * drop; past this, one is left unseen, so a later replay or catch-up can still
+ * deliver it. */
+const BACKLOG_LIMIT = 512;
+/** Channels whose recent ids each agent keeps for replay dedup, the most
+ * recently active first. */
+const SEEN_CHANNELS = 128;
 /** Runs per agent per minute; bounds two agents that answer each other. */
 const RATE_LIMIT = 60;
 const RATE_WINDOW_MS = 60_000;
@@ -64,9 +76,9 @@ const RATE_WINDOW_MS = 60_000;
 /** Classifier calls in flight per agent. */
 const CLASSIFY_LIMIT = 32;
 
-const bounded = (set: Set<string>, id: string) => {
+const bounded = (set: Set<string>, id: string, limit = SEEN_LIMIT) => {
   set.add(id);
-  if (set.size > SEEN_LIMIT) set.delete(set.values().next().value as string);
+  if (set.size > limit) set.delete(set.values().next().value as string);
 };
 
 /** The model and effort the triggering message asks of this agent. Only the
@@ -132,6 +144,13 @@ type Runner = {
   admitted: number;
   /** Events seen, and events it wrote (so reactions to them reach no watch). */
   readonly seen: Set<string>;
+  /** Events seen in each channel, as many as a reconnect replays of it, so
+   * other channels' traffic cannot push out one a replay sends again. Only the
+   * `SEEN_CHANNELS` most recently active channels are kept. */
+  readonly seenIn: Map<string, Set<string>>;
+  /** Replayed events waiting, oldest first, until the agent has room for the
+   * jobs each makes. */
+  readonly backlog: { event: RelayEvent; channelId?: string }[];
   readonly wrote: Set<string>;
   /** Turns still counted as working, which a change of type waits out. */
   working: number;
@@ -139,6 +158,9 @@ type Runner = {
   readonly typing: Pulses;
   /** A provider/config transition owns the idle runner and pauses its queue. */
   transitioning: boolean;
+  /** Watched events whose channel roster is not confirmed yet, by id: they are
+   * matched again once it is (see `RunnerHost.member`). */
+  readonly held: Map<string, { event: RelayEvent; channelId?: string }>;
   /** Whether native may hold the agent for this copy; true at first, since
    * native outlives a page reload. */
   mayHold: boolean;
@@ -176,8 +198,9 @@ export type RunnerHost = {
   ready(pubkey: string): Agent | undefined;
   /** A running agent, in any community. */
   agent(pubkey: string): Agent | undefined;
-  /** Whether the agent is in the event's channel. */
-  member(agent: Agent, event: RelayEvent): boolean;
+  /** Whether the agent is in the event's channel, or undefined while its
+   * roster is only the one saved on disk and the relay has not confirmed it. */
+  member(agent: Agent, event: RelayEvent): boolean | undefined;
   /** Whether the event's channel is a DM between the agent and one other. */
   dm(agent: Agent, event: RelayEvent): boolean;
   /** The partition its community's activity is kept under, while live. */
@@ -288,7 +311,10 @@ export class AgentRunners {
   }
   /** Wakes each runner, which starts any timer that is due. */
   tick() {
-    for (const runner of this.runners.values()) void this.drain(runner);
+    for (const runner of this.runners.values()) {
+      this.admit(runner);
+      void this.drain(runner);
+    }
   }
   /** Whether this copy runs the agent: its type can run it, and no other
    * copy of the app holds it. */
@@ -355,10 +381,13 @@ export class AgentRunners {
       windowStart: 0,
       admitted: 0,
       seen: new Set(),
+      seenIn: new Map(),
+      backlog: [],
       wrote: new Set(),
       working: 0,
       typing: new Map(),
       transitioning: false,
+      held: new Map(),
       mayHold: true,
       epoch: 0,
       lanes: new Lanes(),
@@ -369,6 +398,8 @@ export class AgentRunners {
   private retire(runner: Runner) {
     this.host.activity.clear(undefined, runner.pubkey);
     runner.queue.length = 0;
+    runner.held.clear();
+    runner.backlog.length = 0;
     runner.controller.abort();
     runner.lanes.stop();
   }
@@ -392,38 +423,146 @@ export class AgentRunners {
     return watches;
   }
 
-  /** Gives a community's live events to the agents in it. */
-  dispatch(batch: LiveBatch, heard: (agent: Agent) => boolean) {
+  /** Gives a community's live events, and replayed ones from `since` on, to
+   * the agents in it. */
+  dispatch(batch: LiveBatch, heard: (agent: Agent) => boolean, since: number) {
     for (const runner of this.runners.values()) {
       const agent = this.host.ready(runner.pubkey);
       if (!agent || !heard(agent) || !runner.type?.run) continue;
+      let overflow = 0;
       for (const event of batch.events) {
-        if (runner.seen.has(event.id)) continue;
-        bounded(runner.seen, event.id);
+        if (batch.replay && event.created_at < since) continue;
+        const channel = event.tags.find((tag) => tag[0] === "h")?.[1];
+        const seenIn = channel ? runner.seenIn.get(channel) : undefined;
+        if (runner.seen.has(event.id) || seenIn?.has(event.id)) continue;
+        // Left unseen, so a later replay or catch-up can still deliver it.
+        if (batch.replay && runner.backlog.length >= BACKLOG_LIMIT) {
+          overflow++;
+          continue;
+        }
+        this.markSeen(runner, event.id, channel);
         // An agent never hears itself; its own events keep reactions to them
         // from its watches.
         if (event.pubkey === agent.pubkey) {
           bounded(runner.wrote, event.id);
           continue;
         }
-        for (const trigger of this.heard(runner, agent, event)) {
-          const job = {
-            trigger,
+        // A replay waits for room rather than take the drops a burst of
+        // live traffic would.
+        if (batch.replay)
+          runner.backlog.push({
+            event,
             ...(batch.channelId ? { channelId: batch.channelId } : {}),
-            ...(trigger.type === "watch"
-              ? {
-                  matched: {
-                    object: agent.attention[trigger.slug] as AttentionObject,
-                    epoch: runner.epoch,
-                  },
-                }
-              : {}),
-          };
-          if (trigger.type === "watch" && trigger.watch.classifier)
-            this.classified(runner, agent, { ...job, trigger });
-          else this.enqueue(runner, job);
-        }
+          });
+        else this.deliver(runner, agent, event, batch.channelId);
       }
+      if (overflow)
+        console.warn(
+          `Agent ${agent.name} left ${overflow} replayed events for later`,
+        );
+      if (batch.replay) this.admit(runner);
+    }
+  }
+  private markSeen(runner: Runner, id: string, channel: string | undefined) {
+    bounded(runner.seen, id);
+    if (!channel) return;
+    const ids = runner.seenIn.get(channel) ?? new Set<string>();
+    // Moved to the newest end, so the quietest channel is forgotten first.
+    runner.seenIn.delete(channel);
+    runner.seenIn.set(channel, ids);
+    bounded(ids, id, LIVE_REPLAY_LIMIT);
+    if (runner.seenIn.size > SEEN_CHANNELS)
+      runner.seenIn.delete(runner.seenIn.keys().next().value as string);
+  }
+  /** Whether the agent can take `jobs` more jobs, `classified` of them first
+   * through the classifier, without dropping any. Events still being
+   * classified will take queue and rate room too. */
+  private fits(runner: Runner, jobs: number, classified: number) {
+    const admitted =
+      Date.now() - runner.windowStart >= RATE_WINDOW_MS ? 0 : runner.admitted;
+    return (
+      runner.queue.length + runner.classifying + jobs <= QUEUE_LIMIT &&
+      runner.classifying + classified <= CLASSIFY_LIMIT &&
+      admitted + runner.classifying + jobs <= RATE_LIMIT
+    );
+  }
+  /** Delivers backlogged events, oldest first, while the agent has room for
+   * every job each makes; the rest wait for a later tick. Each is matched
+   * against the agent's attention as it is when it is delivered. */
+  private admit(runner: Runner) {
+    const agent = this.host.ready(runner.pubkey);
+    if (!agent || !runner.type?.run) return;
+    while (runner.backlog.length) {
+      const { event, channelId } = runner.backlog[0] as Runner["backlog"][0];
+      const triggers = this.heard(runner, agent, event);
+      if (
+        triggers === "held"
+          ? runner.held.size >= HELD_LIMIT
+          : // One that makes more jobs than an idle agent takes goes when
+            // it is idle, and loses the excess as live delivery would.
+            !this.fits(
+              runner,
+              Math.min(triggers.length, QUEUE_LIMIT),
+              Math.min(
+                triggers.filter((t) => t.type === "watch" && t.watch.classifier)
+                  .length,
+                CLASSIFY_LIMIT,
+              ),
+            )
+      )
+        return;
+      runner.backlog.shift();
+      this.deliver(runner, agent, event, channelId, triggers);
+    }
+  }
+  /** Matches the held events of a community's agents again, as its rosters
+   * change: one now confirmed wakes the watches it matches, or none. They go
+   * back through the backlog, ahead of what came after them: a confirmed
+   * roster can release more than the agent has room for at once, and each is
+   * already seen, so one dropped here would never come again. */
+  releaseHeld(heard: (agent: Agent) => boolean) {
+    for (const runner of this.runners.values()) {
+      if (!runner.held.size) continue;
+      const agent = this.host.ready(runner.pubkey);
+      if (!agent || !heard(agent)) continue;
+      runner.backlog.unshift(...runner.held.values());
+      runner.held.clear();
+      this.admit(runner);
+    }
+  }
+  private deliver(
+    runner: Runner,
+    agent: Agent,
+    event: RelayEvent,
+    channelId: string | undefined,
+    triggers = this.heard(runner, agent, event),
+  ) {
+    if (triggers === "held") {
+      runner.held.set(event.id, { event, ...(channelId ? { channelId } : {}) });
+      if (runner.held.size > HELD_LIMIT) {
+        runner.held.delete(runner.held.keys().next().value as string);
+        console.warn(
+          `Agent ${agent.name} dropped a watched event its roster held`,
+        );
+      }
+      return;
+    }
+    for (const trigger of triggers) {
+      const job = {
+        trigger,
+        ...(channelId ? { channelId } : {}),
+        ...(trigger.type === "watch"
+          ? {
+              matched: {
+                object: agent.attention[trigger.slug] as AttentionObject,
+                epoch: runner.epoch,
+              },
+            }
+          : {}),
+      };
+      if (trigger.type === "watch" && trigger.watch.classifier)
+        this.classified(runner, agent, { ...job, trigger });
+      else this.enqueue(runner, job);
     }
   }
   /** Runs a matched watch's classifier, then queues the event if it passes.
@@ -503,7 +642,13 @@ export class AgentRunners {
       }
     })();
   }
-  private heard(runner: Runner, agent: Agent, event: RelayEvent): Trigger[] {
+  /** What `event` wakes in the agent, or "held" while a watch it matches waits
+   * for its channel's roster to be confirmed. */
+  private heard(
+    runner: Runner,
+    agent: Agent,
+    event: RelayEvent,
+  ): Trigger[] | "held" {
     const wrote = (id: string) => runner.wrote.has(id);
     // Another of the owner's agents wakes it only by naming it, wherever: were a
     // watch enough, two agents replying to each other would never stop. The
@@ -528,10 +673,20 @@ export class AgentRunners {
       return CHAT_KINDS.includes(event.kind)
         ? [{ type: "mention", event }]
         : [];
-    if (!agent.attentionEnabled || !this.host.member(agent, event)) return [];
-    return this.watches(runner, agent)
-      .filter(({ watch, filter }) => watchMatches(watch, event, filter))
-      .map(({ filter: _, ...match }) => ({ type: "watch", event, ...match }));
+    if (!agent.attentionEnabled) return [];
+    const matches = this.watches(runner, agent).filter(({ watch, filter }) =>
+      watchMatches(watch, event, filter),
+    );
+    if (!matches.length) return [];
+    const member = this.host.member(agent, event);
+    if (member === undefined) return "held";
+    return member
+      ? matches.map(({ filter: _, ...match }) => ({
+          type: "watch",
+          event,
+          ...match,
+        }))
+      : [];
   }
   /** The job as it should run now, or undefined when it should not run: a
    * watch's event is matched again against the agent's current attention, so
