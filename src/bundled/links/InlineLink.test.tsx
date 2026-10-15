@@ -61,10 +61,14 @@ it("renders private channel links with the design-system lock icon", () => {
 
 it.each([
   "javascript:alert(1)",
+  "JaVaScRiPt:alert(1)",
+  "java\tscript:alert(1)",
   "data:text/html,hello",
+  "//github.com/block/buzz",
   "buzz://unknown",
   "not a URL",
 ])("leaves unsupported destinations as plain text: %s", (href) => {
+  expect(linkKind(href)).toBeNull();
   expect(
     renderToStaticMarkup(<InlineLink href={href}>Reference</InlineLink>),
   ).toBe("Reference");
