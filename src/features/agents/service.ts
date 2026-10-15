@@ -42,6 +42,7 @@ import { avatarSource } from "../../shared/avatar-source";
 import { publicKeyLabels } from "../../shared/identity/public-key";
 import { newer, type EventData, type RelayEvent } from "../relay/events";
 import { relayPartition } from "../relay/partition";
+import { threadReference } from "../relay/thread-reference";
 import type { RelayData } from "../relay/service";
 import type { RelaySession } from "../relay/session";
 import {
@@ -55,11 +56,20 @@ import {
 } from "./attention";
 import type {
   ClassifierAvailability,
+  ClassifierKey,
   Shown,
   WatchFilter,
   WatchSummary,
   WriteOptions,
 } from "./attention-objects";
+import {
+  excerpt,
+  mentionFacts,
+  nativeClassifier,
+  type ClassifierContext,
+  type ClassifierNative,
+  type ClassifierOutcome,
+} from "./classifier";
 import {
   nativeAgents,
   type AgentEventTemplate,
@@ -224,11 +234,7 @@ export type AgentAttention = Readonly<{
     options: WriteOptions,
   ): Promise<Shown>;
 }>;
-/** Why a classified watch's event passed without a classifier answer. */
-export type ClassifierSkip = Readonly<{
-  outcome: "not-run";
-  reason: string;
-}>;
+export type { ClassifierOutcome } from "./classifier";
 export type Trigger =
   /** Directly addressed: a chat message that mentions the agent. */
   | Readonly<{ type: "mention"; event: RelayEvent }>
@@ -240,10 +246,10 @@ export type Trigger =
       watch: EventWatch;
       /** Absent when the watch names an Interest that does not exist. */
       interest?: Interest;
-      /** Set when the watch has a classifier that did not run. The event
-       * passes rather than lose a match to an unavailable model, and the
-       * agent is told why. */
-      classifier?: ClassifierSkip;
+      /** Set when the watch has a classifier: its answers, or why it did
+       * not run or failed. An event the classifier cannot check passes
+       * rather than lose a match, and the agent is told why. */
+      classifier?: ClassifierOutcome;
     }>
   | Readonly<{
       type: "timer";
@@ -452,6 +458,10 @@ export type RetypePreview = Readonly<{
 }>;
 export type AgentsSnapshot = Readonly<{
   status: "unavailable" | "loading" | "ready" | "error";
+  /** Whether a watch's classifier can run on this device now. */
+  classifier: ClassifierAvailability;
+  /** What is known about the saved classifier key, for the owner. */
+  classifierKey: ClassifierKey;
   /** The selected community's agents, while it is connected. */
   agents: readonly Agent[];
   /** Every agent kept running here, whichever community is selected: the
@@ -563,6 +573,12 @@ export type Agents = {
    * leaves its channels and is removed from its provider before this resolves.
    * One on another device is deleted there. */
   remove(pubkey: string): Promise<void>;
+  /** Whether a watch's classifier can run on this device now. */
+  classifier(): ClassifierAvailability;
+  /** Saves the TypeSafe key in native storage, which the classifier uses.
+   * It is never read back into the app or given to an agent. */
+  setClassifierKey(key: string): Promise<void>;
+  clearClassifierKey(): Promise<void>;
   /** Creates a team, or replaces the one with `id`. Members must be agents on
    * this device. */
   saveTeam(team: TeamChange): Promise<Team>;
@@ -599,6 +615,8 @@ function defaults(pubkey: string, type: RegisteredAgentType) {
     record = setAttention(record, slug, value);
   return record;
 }
+/** How long the classifier waits for a reply's parent before it goes on. */
+const PARENT_LOOKUP_MS = 5_000;
 const message = (error: unknown) =>
   String(error instanceof Error ? error.message : error);
 /** The team sections for agent `self`: each team it is on, its members that
@@ -725,6 +743,13 @@ const wssOf = (origin: string) =>
   relayOrigin(origin).replace(/^https:/, "wss:");
 
 export class AgentsService extends Service implements Agents {
+  /** Settles once the saved key's status is known; until then a classified
+   * event waits rather than pass unchecked. */
+  private jevStatus: Promise<void> | undefined;
+  /** Goes up when a save or remove of the key starts and when it ends, so
+   * that what a read or classifier call found under an older key is not
+   * shown over the newer one. */
+  private keyGeneration = 0;
   private readonly contributions;
   private readonly listeners = new Set<() => void>();
   /** Every saved identity, deleted ones included: native's list is the agent
@@ -781,6 +806,7 @@ export class AgentsService extends Service implements Agents {
       signal: AbortSignal,
     ) => Promise<NipOaAuthorization> = prepareRemoteAgentAuthorization,
     localActivity = createLocalAgentActivity(),
+    private readonly jev: ClassifierNative | undefined = nativeClassifier(),
   ) {
     super(ctx, "agents");
     this.contributions = createContributions<AgentType>(ctx);
@@ -790,6 +816,8 @@ export class AgentsService extends Service implements Agents {
     this.teamList = Object.freeze(readTeams(storage));
     this.state = Object.freeze({
       status: native ? "loading" : "unavailable",
+      classifier: "unavailable",
+      classifierKey: "checking",
       agents: [],
       running: [],
       teams: this.teamList,
@@ -797,7 +825,6 @@ export class AgentsService extends Service implements Agents {
     this.runners = new AgentRunners({
       ready: (pubkey) => this.ready(pubkey),
       agent: (pubkey) => this.agent(pubkey),
-      find: (pubkey) => this.find(pubkey),
       member: (agent, event) => this.member(agent, event),
       dm: (agent, event) => this.dm(agent, event),
       scope: (agent) => this.bindingOf(agent)?.scope,
@@ -833,6 +860,15 @@ export class AgentsService extends Service implements Agents {
         }));
       },
       classifier: () => this.classifier(),
+      jev: () => this.jev,
+      jevStatus: () => this.jevStatus,
+      classifierKey: () => this.state.classifierKey,
+      classifierKeyGeneration: () => this.keyGeneration,
+      setClassifierKey: (key, generation) => {
+        if (generation === this.keyGeneration) this.setKey(key);
+      },
+      context: (agent, event) => this.context(agent, event),
+      displayName: (agent, pubkey) => this.displayName(agent, pubkey),
       custody: native,
       activity: localActivity,
       meChat: (agent, channel, signal) =>
@@ -851,6 +887,17 @@ export class AgentsService extends Service implements Agents {
       ];
       this.watch();
       void this.refresh();
+      const generation = this.keyGeneration;
+      const found = (key: ClassifierKey) => {
+        if (generation === this.keyGeneration) this.setKey(key);
+      };
+      this.jevStatus = this.jev
+        ?.status()
+        .then((configured) => found(configured ? "saved" : "missing"))
+        .catch((error) => {
+          console.warn("The classifier key could not be read", error);
+          found("unreadable");
+        });
       // Wakes each runner, which starts any timer that is due.
       const tick = setInterval(() => {
         this.runners.tick();
@@ -973,8 +1020,103 @@ export class AgentsService extends Service implements Agents {
       { config, picture },
     );
   }
-  /** Whether watch classifiers can run on this device. */
-  private classifier = (): ClassifierAvailability => "unavailable";
+  /** Whether watch classifiers can run on this device: a key is saved. */
+  classifier(): ClassifierAvailability {
+    return this.state.classifier;
+  }
+  async setClassifierKey(key: string) {
+    const jev = this.jev;
+    if (!jev) throw new Error("The classifier runs only in the desktop app");
+    await this.changeKey(() => jev.setKey(key));
+    this.setKey("saved");
+  }
+  async clearClassifierKey() {
+    const jev = this.jev;
+    if (!jev) throw new Error("The classifier runs only in the desktop app");
+    await this.changeKey(() => jev.clearKey());
+    this.setKey("missing");
+  }
+  /** Saves or removes the key. A read or classifier call that started before
+   * it ends may have used the old key, so its finding is ignored. */
+  private async changeKey(change: () => Promise<void>) {
+    this.keyGeneration++;
+    try {
+      await change();
+    } finally {
+      this.keyGeneration++;
+    }
+  }
+  /** Agents are told a classifier can run only while a key is known to be
+   * saved. A key the service refused still runs, and each event reports why
+   * it passed unchecked. */
+  private setKey(classifierKey: ClassifierKey) {
+    const classifier =
+      classifierKey === "saved" || classifierKey === "refused"
+        ? "available"
+        : "unavailable";
+    if (this.state.classifierKey === classifierKey) return;
+    this.state = Object.freeze({ ...this.state, classifier, classifierKey });
+    this.notify();
+  }
+  /** The event's surroundings for the classifier, from what the app knows. */
+  private async context(
+    agent: Agent,
+    event: RelayEvent,
+  ): Promise<ClassifierContext> {
+    const channelId = event.tags.find((tag) => tag[0] === "h")?.[1];
+    const channels = this.bindingOf(agent)?.session.channels;
+    const summary = channelId
+      ? (channels?.list().channels.find((item) => item.id === channelId) ??
+        channels?.get?.(channelId))
+      : undefined;
+    const parent = threadReference(event)?.parentId ?? null;
+    let found: RelayEvent | undefined;
+    const native = this.native;
+    if (parent && native)
+      try {
+        // Bounded: classified events release in order, so a stuck lookup
+        // would hold back every later one.
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        [found] = await Promise.race([
+          native.query(agent.pubkey, [{ ids: [parent], limit: 1 }]),
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(
+              () => reject(new Error("The parent lookup timed out")),
+              PARENT_LOOKUP_MS,
+            );
+          }),
+        ]).finally(() => clearTimeout(timer));
+      } catch {
+        // The parent stays unknown; the classifier still runs.
+      }
+    return {
+      channel: { name: summary?.name ?? null },
+      thread: {
+        is_reply: !!parent,
+        parent: found
+          ? {
+              author: {
+                role:
+                  found.pubkey === agent.pubkey
+                    ? "self"
+                    : found.pubkey === agent.owner
+                      ? "owner"
+                      : "other",
+                name: this.displayName(agent, found.pubkey),
+              },
+              content: excerpt(found.content),
+            }
+          : null,
+      },
+      mentions: mentionFacts(event.tags, agent.pubkey, agent.owner),
+    };
+  }
+  private displayName(agent: Agent, pubkey: string) {
+    return (
+      this.bindingOf(agent)?.session.profiles?.snapshot().get(pubkey)?.name ??
+      null
+    );
+  }
 
   /** Has the provider make the agent, then sets it up. From here on it is
    * kept, unfinished until set up, so a failure never makes a second one. */
