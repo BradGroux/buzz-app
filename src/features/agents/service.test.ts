@@ -5212,6 +5212,78 @@ it("lists only an HTTPS picture of a hosted agent", async () => {
   expect(remote.profile).not.toHaveBeenCalled();
 });
 
+it("adds plugins' tools to every session, each name once", async () => {
+  const { service, plugin, ctx } = await setup();
+  const tool = {
+    name: "tasks_create",
+    description: "Create a task.",
+    inputSchema: { type: "object" },
+    call: async () => "created",
+  };
+  // Installed plugins add tools as bundled ones do.
+  plugin.agents.addTool({ ...tool, name: "notes_add" });
+  expect(service.tools()).toMatchObject([
+    { name: "notes_add", pluginId: "example" },
+  ]);
+  const bundled = (id: string) =>
+    ctx.extend({ pluginOwner: Object.freeze({ id, revision: "bundled" }) });
+  const tasks = bundled("buzz.tasks");
+  for (const bad of [
+    { ...tool, name: "send" },
+    { ...tool, name: "Tasks-Create" },
+    { ...tool, description: "" },
+    { ...tool, inputSchema: { type: "string" } },
+    { ...tool, inputSchema: { type: "object", default: 1n } },
+  ])
+    expect(() => tasks.agents.addTool(bad)).toThrow(/Agent tools need/);
+  expect(service.tools()).toHaveLength(1);
+  tasks.agents.addTool(tool);
+  expect(() =>
+    bundled("buzz.other").agents.addTool({
+      ...tool,
+      call: async () => "other",
+    }),
+  ).toThrow(/Another plugin/);
+  expect(service.tools()).toMatchObject([
+    { name: "notes_add", pluginId: "example" },
+    { name: "tasks_create", pluginId: "buzz.tasks" },
+  ]);
+});
+
+it("reserves a tool name while its plugin is still starting", async () => {
+  const ctx = new Context();
+  ctx.provide("pluginStatus", {
+    isActive: () => false,
+    subscribe: () => () => {},
+  });
+  const service = new AgentsService(
+    ctx,
+    fakeCommunities(fakeRelay()).communities,
+    fakeNative(),
+    memoryStorage(),
+  );
+  const tool = {
+    name: "tasks_create",
+    description: "Create a task.",
+    inputSchema: { type: "object" },
+    call: async () => "created",
+  };
+  const owner = (id: string) =>
+    ctx.extend({ pluginOwner: Object.freeze({ id, revision: "bundled" }) });
+  const first = owner("buzz.tasks").plugin({
+    inject: ["agents"],
+    apply: (plugin: Context) => plugin.agents.addTool(tool),
+  });
+  await first;
+  // Neither plugin is active yet, and still the name is taken.
+  expect(service.tools()).toEqual([]);
+  expect(() => owner("buzz.other").agents.addTool(tool)).toThrow(
+    /Another plugin/,
+  );
+  await first.dispose();
+  owner("buzz.other").agents.addTool(tool);
+});
+
 it("refuses a hosted type that also runs here", async () => {
   const { plugin } = await setup();
   const { type } = cloud();

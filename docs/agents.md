@@ -47,6 +47,17 @@ note that it is off when it is off. `callSessionTool` dispatches each call and
 refuses attention calls while attention is off. A new shared tool needs no
 harness change.
 
+Plugins add tools with `ctx.agents.addTool`, listed after the Buzz
+tools under the same `buzz` server; the standalone server in
+`src/buzz-mcp/main.ts` stays without them. A harness reads `agents.tools()`
+and passes it to `respond` or `callSessionTool`. A session keeps the list it
+started with, so `addedKey` goes in what decides when one is replaced: the
+Claude and goose session fingerprints, Claude's spare, and each saved Codex
+binding, since `thread/resume` keeps a thread's tools. Claude and goose resume
+their sessions when replaced, but a Codex agent starts a new thread and loses its
+context. That happens once when a plugin with tools ships, and again whenever a
+tool's name, description or schema changes, so edit those deliberately.
+
 The Agents runner starts a mention run from a `p` tag, or from any new message
 by the other member of a one-to-one DM the agent is in; group DMs still need
 the mention. It also owns watches and timers.
