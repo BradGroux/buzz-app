@@ -68,6 +68,50 @@ The hover case replaces `channel-open-prepared`, which waited for a completed he
 response and an idle opportunity. Those older results are a different workload;
 collect a new baseline rather than comparing them as equivalent.
 
+## Scrolling
+
+```sh
+bin/pnpm perf --scenario scroll-short --repeat 5 --cpu 4
+bin/pnpm perf --scenario scroll-long --repeat 5 --cpu 4
+```
+
+Both scenarios use the same observer, counters, fresh contexts and result format:
+
+| Scenario | Workload |
+| --- | --- |
+| `scroll-short` | 800px upward at 1600px/s within the loaded head of a 120-message channel |
+| `scroll-long` | 12,000px upward at 4000px/s across a 360-message channel, fully loaded before measuring |
+
+The long case loads older pages without traversing them first, so the gesture
+encounters rows the virtualizer has not yet mounted/measured. Setup waits for
+page processing to finish, rejects the history-limit notice, then settles geometry.
+Neither window permits older-page reads. This isolates rendering from pagination;
+network-bound scrolling should be a separate future scenario.
+
+Real Chromium wheel gestures must produce wheel events, scroll-offset movement
+of at least 80% of the request, multiple visible messages and changed visible IDs.
+Raw frames and work receipts record the requested distance/speed, history size,
+released pages, wheel count and observed rows. `scrollTopRangePx` is the observed
+offset range, including virtualizer corrections; it is not physical input distance.
+
+`rafMaxGapMs`, `rafP95GapMs` and `rafGapsOver50` describe animation-frame callback
+cadence during the gesture. Raw `gestureStartMs` and `gestureEndMs` timestamps
+are relative to the recording start: the first observed wheel event and the
+browser marker after Chromium reports the synthetic gesture complete. The end
+includes that marker's protocol dispatch. Gaps are clipped to those boundaries,
+including partial gaps before the first and after the last callback inside the
+window. All callbacks count, including stalls when the scroll offset is unchanged.
+The settling tail after the end marker is excluded from cadence only:
+`scriptMs`, `layoutMs`, `styleMs`, `taskMs` and `durationMs` still cover scrolling
+plus settling, with the same measurement overhead.
+
+Recordings without these gesture timestamps used whole-operation cadence,
+including the settling tail. Their cadence values are not comparable with the
+new definition; rerun baselines before comparing. No summary metrics were added.
+Callback gaps expose main-thread stalls, not compositor FPS or a measured
+dropped-frame count. No generic blank-time, overlap or visual-shift verdict is
+inferred from them.
+
 ## Results and iteration
 
 JSON contains raw per-frame geometry, work evidence, all samples and per-metric

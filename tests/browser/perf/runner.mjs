@@ -29,6 +29,7 @@ function observe({ selector, ids, click, hoverMs }) {
     resolve;
   let wheels = 0;
   let inputAt, hoverAt;
+  let gestureStartMs, gestureEndMs;
   const hovered = (event) => {
     if (hoverMs && event.target.closest(click)) hoverAt ??= performance.now();
   };
@@ -39,7 +40,10 @@ function observe({ selector, ids, click, hoverMs }) {
     resolve = r;
   });
   const wheel = (event) => {
-    if (event.target.closest(selector)) wheels++;
+    if (event.target.closest(selector)) {
+      wheels++;
+      gestureStartMs ??= performance.now() - start;
+    }
   };
   document.addEventListener("wheel", wheel, { passive: true });
   document.addEventListener("click", clicked, true);
@@ -54,6 +58,8 @@ function observe({ selector, ids, click, hoverMs }) {
       error,
       frames,
       wheels,
+      gestureStartMs,
+      gestureEndMs,
       firstRowsMs,
       hoverLeadMs:
         hoverAt === undefined || inputAt === undefined
@@ -132,6 +138,10 @@ function observe({ selector, ids, click, hoverMs }) {
       raf = requestAnimationFrame(sample);
     },
     done() {
+      // The scrolling action resolves after Chromium's synthetic gesture does.
+      // This existing browser marker includes the completion protocol dispatch.
+      if (gestureStartMs !== undefined)
+        gestureEndMs = performance.now() - start;
       done = true;
     },
     result: () => result,
