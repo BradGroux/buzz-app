@@ -38,6 +38,13 @@ test("middle-click closes a content tab without selecting it", async ({
   });
   await expect(settings).toHaveAttribute("aria-selected", "true");
   await beta.click({ button: "right" });
+  await expect(
+    page.getByRole("menuitem", { name: "Close all tabs", exact: true }),
+  ).toBeVisible();
+  // The popup can paint before its animation-frame focus handoff completes.
+  await expect(page.getByRole("menu")).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("menu")).toHaveCount(0);
   await expect(beta).toBeVisible();
   const draft = main.getByRole("textbox", {
     name: "Message #Alpha",
