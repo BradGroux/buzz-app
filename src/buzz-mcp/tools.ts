@@ -10,6 +10,10 @@ import {
   lifecycleChannelId,
   lifecycleTemplate,
 } from "../features/relay/channel-lifecycle-protocol";
+import {
+  PROFILE_SEARCH_MAX,
+  PROFILE_SEARCH_QUERY_MAX,
+} from "../features/relay/profile-search";
 import { sessionMetadata } from "../features/sessions/metadata";
 import { threadReference } from "../features/relay/thread-reference";
 import type { BuzzClient, BuzzEvent, Context, Filter, Upload } from "./client";
@@ -473,11 +477,21 @@ const HANDLERS: Readonly<Record<string, Handler>> = {
     const ids = list(args.ids).map(pubkey);
     const q = text(args.q)?.toLowerCase();
     if (!ids.length && !q) throw new Error("Give ids or q.");
-    const profiles = await client.query([
-      ids.length
-        ? { kinds: [0], authors: ids, limit: ids.length }
-        : { kinds: [0], search: q, limit: 100 },
-    ]);
+    // Name search matches only name and display_name, best match first;
+    // NIP-50 search matches the whole profile, so text in avatars or `about`
+    // can fill its results and hide the person asked for. Name search refuses
+    // a query longer than its limit, so a longer name uses NIP-50 search.
+    const named =
+      !ids.length && q && [...q].length <= PROFILE_SEARCH_QUERY_MAX
+        ? await client.searchProfiles?.(q, PROFILE_SEARCH_MAX)
+        : undefined;
+    const profiles =
+      named?.filter((event) => event.kind === 0) ??
+      (await client.query([
+        ids.length
+          ? { kinds: [0], authors: ids, limit: ids.length }
+          : { kinds: [0], search: q, limit: 100 },
+      ]));
     const rows = newest(profiles)
       .map((event) => {
         const profile = parse(event.content);
@@ -488,7 +502,10 @@ const HANDLERS: Readonly<Record<string, Handler>> = {
             : "";
         return { name, row: `${event.pubkey} ${name}${about}` };
       })
-      .filter(({ name }) => !q || ids.length || name.toLowerCase().includes(q));
+      .filter(
+        ({ name }) =>
+          !q || ids.length || named || name.toLowerCase().includes(q),
+      );
     return rows.map(({ row }) => row).join("\n") || "No users.";
   },
 
