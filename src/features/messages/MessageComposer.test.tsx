@@ -539,6 +539,36 @@ it("autofocuses each selected conversation once without stealing focus on update
   }
 });
 
+it("defers initial focus until a loading conversation enables its composer", () => {
+  const h = mount({ autoFocus: true, disabled: true });
+  expect(h.input()).not.toHaveFocus();
+  h.retarget({ disabled: false });
+  expect(h.input()).toHaveFocus();
+});
+
+it("does not redo initial focus when a focused composer is disabled and enabled again", () => {
+  writeView("scope", "draft:channel", "Saved draft");
+  const h = mount({ autoFocus: true });
+  act(() => h.input().setSelectionRange(1, 4));
+  h.retarget({ disabled: true });
+  h.retarget({ disabled: false });
+  expect(h.input().selectionStart).toBe(1);
+  expect(h.input().selectionEnd).toBe(4);
+});
+
+it("does not take focus when the composer is enabled after another control takes it", () => {
+  const other = document.createElement("button");
+  document.body.append(other);
+  try {
+    const h = mount({ autoFocus: true, disabled: true });
+    other.focus();
+    h.retarget({ disabled: false });
+    expect(other).toHaveFocus();
+  } finally {
+    other.remove();
+  }
+});
+
 it("defers initial focus until an inert startup ancestor is revealed", async () => {
   document.body.setAttribute("inert", "");
   try {
@@ -597,6 +627,20 @@ it.each([
     expect(owner).toHaveFocus();
   } finally {
     owner.remove();
+  }
+});
+
+it("takes focus from a row whose hover preview is open when the conversation mounts", () => {
+  const row = document.createElement("button");
+  row.setAttribute("data-popup-open", "");
+  row.setAttribute("data-popup-preview", "");
+  document.body.append(row);
+  try {
+    row.focus();
+    const h = mount({ autoFocus: true });
+    expect(h.input()).toHaveFocus();
+  } finally {
+    row.remove();
   }
 });
 
