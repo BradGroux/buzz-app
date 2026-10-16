@@ -1390,7 +1390,7 @@ it("keeps room for mentions however much watch work waits", async () => {
   run.mockImplementationOnce(() => blocked);
   emit({ events: [event("first")] });
   await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(1));
-  // More watch work than its queue holds, then a mention.
+  // More watch work than its Interest holds, then a mention.
   emit({
     events: Array.from({ length: 40 }, (_, i) =>
       event(`w${i}x`, { created_at: 101 + i }),
@@ -1409,11 +1409,121 @@ it("keeps room for mentions however much watch work waits", async () => {
   });
   await settle();
   unblock();
-  // The mention is heard next; the watch queue kept its own 32.
-  await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(34));
+  // The mention is heard next; the watch's Interest kept its own 8.
+  await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(10));
   await settle();
-  expect(run).toHaveBeenCalledTimes(34);
+  expect(run).toHaveBeenCalledTimes(10);
   expect(turns(run).slice(0, 3)).toEqual(["watch", "mention", "watch"]);
+});
+
+it("runs one turn at a time for an Interest, Interests and mentions beside each other, and frees a lane to the oldest waiting job", async () => {
+  const { service, run, emit } = await setup({ identities: [echo] });
+  const watch = (interest: string, kind: number) => ({
+    type: "event" as const,
+    interest_id: interest,
+    enabled: true,
+    since: 1,
+    channels: [channel],
+    kinds: [kind],
+  });
+  await service.save(bot, {
+    attentionEnabled: true,
+    attention: {
+      "watch/channel": null,
+      "watch/a": watch("a", 9),
+      "watch/b": watch("b", 11),
+    },
+  });
+  await settle();
+  const pending = new Map<string, () => void>();
+  run.mockImplementation(
+    ({ trigger }) =>
+      new Promise<void>((resolve) => {
+        pending.set(
+          trigger.type === "timer" || trigger.type === "catch-up"
+            ? trigger.slug
+            : trigger.event.content,
+          resolve,
+        );
+      }),
+  );
+  const working = () => [...pending.keys()].sort();
+  const finish = async (content: string) => {
+    pending.get(content)?.();
+    pending.delete(content);
+    await settle();
+  };
+  emit({
+    events: [
+      event("a1", { content: "a1", created_at: 101 }),
+      event("a2", { content: "a2", created_at: 102 }),
+      event("b1", { content: "b1", kind: 11, created_at: 103 }),
+      event("b2", { content: "b2", kind: 11, created_at: 104 }),
+    ],
+  });
+  await vi.waitFor(() => expect(working()).toEqual(["a1", "b1"]));
+  // A mention runs beside the busy Interests.
+  emit({
+    events: [
+      event("named", {
+        content: "named",
+        created_at: 105,
+        tags: [
+          ["h", channel],
+          ["p", bot],
+        ],
+      }),
+    ],
+  });
+  await vi.waitFor(() => expect(working()).toEqual(["a1", "b1", "named"]));
+  await finish("b1");
+  expect(working()).toEqual(["a1", "b2", "named"]);
+  await finish("a1");
+  expect(working()).toEqual(["a2", "b2", "named"]);
+  await finish("a2");
+  await finish("b2");
+  await finish("named");
+  expect(run).toHaveBeenCalledTimes(5);
+});
+
+it("runs at most eight Interests at once, and the oldest waiting one next", async () => {
+  const { service, run, emit } = await setup({ identities: [echo] });
+  const attention: Record<string, object | null> = { "watch/channel": null };
+  for (let i = 0; i < 10; i++)
+    attention[`watch/w${i}`] = {
+      type: "event",
+      interest_id: `i${i}`,
+      enabled: true,
+      since: 1,
+      channels: [channel],
+      kinds: [20 + i],
+    };
+  await service.save(bot, {
+    attentionEnabled: true,
+    attention: attention as never,
+  });
+  await settle();
+  const pending = new Map<string, () => void>();
+  run.mockImplementation(
+    ({ trigger }) =>
+      new Promise<void>((resolve) => {
+        if (trigger.type === "watch")
+          pending.set(trigger.event.content, resolve);
+      }),
+  );
+  emit({
+    events: Array.from({ length: 10 }, (_, i) =>
+      event(`e${i}`, { content: `e${i}`, kind: 20 + i, created_at: 101 + i }),
+    ),
+  });
+  await vi.waitFor(() => expect(pending.size).toBe(8));
+  await settle();
+  expect(run).toHaveBeenCalledTimes(8);
+  pending.get("e3")?.();
+  pending.delete("e3");
+  await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(9));
+  expect(pending.has("e8")).toBe(true);
+  expect(pending.has("e9")).toBe(false);
 });
 
 it("passes the model and effort its owner asked for, and no other", async () => {
@@ -4271,6 +4381,82 @@ it("gives a missed event to more of one Interest's watches than its lane holds, 
   }
 }, 10_000);
 
+it("keeps an Interest's room for a catch-up being classified, so live events cannot drop it", async () => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  try {
+    const jev = fakeJev();
+    let answer!: (value: Answer) => void;
+    jev.classify.mockImplementationOnce(
+      () => new Promise((resolve) => (answer = resolve)),
+    );
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const ran: string[] = [];
+    const { service, history, recover, emit } = await setup({
+      jev,
+      identities: [echo],
+      runOnce: async ({ delivery }) => {
+        const { trigger } = delivery;
+        ran.push(
+          trigger.type === "watch" ? (trigger.event.id[0] ?? "") : trigger.type,
+        );
+        if (ran.length === 1) await blocked;
+        return { ok: true };
+      },
+    });
+    const now = nowSeconds();
+    vi.setSystemTime(now * 1000);
+    await service.save(bot, {
+      attentionEnabled: true,
+      attention: {
+        "watch/channel": null,
+        "watch/chat": {
+          ...chat["watch/chat"],
+          classifier: {
+            questions: {
+              deploy: { question: "Is it about a deploy?", threshold: 0.5 },
+            },
+          },
+        },
+        // Live only, in the same Interest.
+        "watch/likes": {
+          type: "event",
+          interest_id: "default",
+          enabled: true,
+          since: 1,
+          channels: [channel],
+          kinds: [7],
+        },
+      },
+    });
+    await settle();
+    vi.setSystemTime((now + 60) * 1000);
+    history.push(posted("missed", now + 30));
+    recover();
+    // The catch-up turn is being classified, and its checkpoint is past it.
+    await vi.waitFor(() => expect(jev.classify).toHaveBeenCalledOnce());
+    await settle();
+    // One runs; of the eight that then wait, the catch-up keeps one.
+    const likes = Array.from({ length: 9 }, (_, i) =>
+      event(`${i}`, { kind: 7, created_at: now + 61 + i }),
+    );
+    emit({ events: likes.slice(0, 1) });
+    await vi.waitFor(() => expect(ran).toEqual(["0"]));
+    emit({ events: likes.slice(1) });
+    await settle();
+    answer(yes);
+    await settle();
+    release();
+    await vi.waitFor(() => expect(ran).toContain("catch-up"));
+    await settle();
+    expect(ran).toEqual(["0", "1", "2", "3", "4", "5", "6", "7", "catch-up"]);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 it("does not give a missed event again after a restart to watches that had it before the rest", async () => {
   vi.useFakeTimers({ toFake: ["Date"] });
   try {
@@ -5811,7 +5997,12 @@ it("stops trying presence on a session that cannot send it", async () => {
   await service.create({ type: "example/echo", name: "Echo" });
   await vi.advanceTimersByTimeAsync(180_000);
   expect(presence).toHaveBeenCalledTimes(1);
-  expect(warn).toHaveBeenCalledTimes(1);
+  // Count only presence warnings: an earlier test's service still runs.
+  const warned = () =>
+    warn.mock.calls.filter(([text]) =>
+      String(text).startsWith("Agent presence cannot be sent"),
+    ).length;
+  expect(warned()).toBe(1);
   presence.mockResolvedValue(true);
   connect(true);
   await vi.advanceTimersByTimeAsync(0);
