@@ -437,7 +437,7 @@ export const COMPONENTS: readonly ComponentDefinition[] = [
       "link",
       "plain: unfilled text disclosure without an underline",
       "size: inline | xs | sm | md (default) | lg",
-      "shape: capsule (default) | control (12px)",
+      "shape: capsule (default) | control (12px) | icon (square, 10px)",
       "SurfaceButton: artwork layout with shared activation and focus (proposed)",
       "loading",
     ],
