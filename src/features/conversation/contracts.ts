@@ -281,5 +281,10 @@ export type PageTabsProps = {
   /** The page's own first tab. `open` shows a joined conversation in a host tab. */
   children(
     open: (target: PageTabTarget, options?: PageTabOptions) => boolean,
+    close: (target: PageTabTarget) => boolean,
+    isOpen: (target: PageTabTarget) => boolean,
   ): ReactNode;
+  /** `false` keeps showing a tab out of its channel visit, so the page decides
+   * what is read; tabs visit as Channels tabs do by default. */
+  visits?: boolean | undefined;
 };
