@@ -6,6 +6,7 @@ import { useConversationTabs } from "./useConversationTabs";
 import tabStyles from "./ChannelTabs.module.css";
 import panelStyles from "../../features/panels/Panels.module.css";
 import { Avatar } from "../../shared/design-system/ui/Avatar";
+import { useToastNotification } from "../../shared/design-system/ui/Toast";
 import { useReturnHighlight } from "../../features/messages/use-return-highlight";
 import { ChannelBody } from "./ChannelBody";
 import { tabPane, useChannelTabState } from "./useChannelTabState";
@@ -593,6 +594,19 @@ function ChannelWorkspace({
       },
     });
   };
+  // A Solo start that fails leaves its chat for New chat only while this
+  // workspace still shows that chat.
+  const showing = useRef(requestedChannel);
+  const notify = useToastNotification();
+  useLayoutEffect(() => {
+    showing.current = requestedChannel;
+  });
+  useLayoutEffect(
+    () => () => {
+      showing.current = undefined;
+    },
+    [],
+  );
   const chooseLatest = useRef(chooseLifecycle);
   useLayoutEffect(() => {
     chooseLatest.current = chooseLifecycle;
@@ -1520,6 +1534,11 @@ function ChannelWorkspace({
               scope={scope}
               extensions={extensions}
               onStarted={select}
+              onFailed={(channelId, message) => {
+                notify(message, "error");
+                if (showing.current === channelId && navigator)
+                  void navigator.open(soloDraftTarget(scope, draft));
+              }}
             />
           ) : (
             <>
