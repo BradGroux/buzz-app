@@ -1083,6 +1083,38 @@ it("opens a deep-link invite on Personal space without claiming until the user c
   expect(t.select).not.toHaveBeenCalled();
 });
 
+it("labels the existing picker Communities only while no community is saved", async () => {
+  const h = harness();
+  h.update({ selected: null, memberships: [] });
+  rtlRender(<CommunityPicker communities={h.communities} />, {
+    wrapper: ToastProvider,
+  });
+  const user = userEvent.setup();
+  const picker = switcher();
+  expect(picker).toHaveTextContent("Communities");
+  expect(picker).toHaveAccessibleName("Community switcher: Communities");
+  expect(
+    within(
+      screen.getByRole("navigation", { name: "Communities" }),
+    ).getAllByRole("button"),
+  ).toHaveLength(1);
+  await user.click(picker);
+  await user.click(screen.getByRole("button", { name: "Join a community" }));
+  expect(
+    screen.getByRole("heading", { name: "Add a community" }),
+  ).toBeVisible();
+  await user.click(screen.getByRole("button", { name: "Close" }));
+  await waitFor(() => expect(picker).toHaveFocus());
+
+  h.update({ memberships: [{ id: primary, name: "Primary" }] });
+  expect(switcher()).not.toHaveTextContent("Communities");
+  expect(switcher()).toHaveAccessibleName("Community switcher: Personal space");
+  h.update({ selected: primary });
+  expect(switcher()).toHaveAccessibleName("Community switcher: Primary");
+  h.update({ selected: null, memberships: [] });
+  expect(switcher()).toHaveTextContent("Communities");
+});
+
 it("shows only the active community until opened and routes creation through Hosted communities", async () => {
   const h = harness();
   const onOpenTarget = vi.fn();
