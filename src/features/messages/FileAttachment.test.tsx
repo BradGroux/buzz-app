@@ -1,21 +1,35 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
 import {
+  act,
   cleanup,
   fireEvent,
   render,
   screen,
-  waitFor,
 } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
+import { ToastProvider } from "../../shared/design-system/ui/Toast";
 import { downloadNativeMedia } from "./native-download";
 import { FileAttachment, formatFileSize } from "./FileAttachment";
 
 vi.mock("./native-download", () => ({ downloadNativeMedia: vi.fn() }));
 
+function deferred() {
+  let resolve!: () => void;
+  let reject!: (reason: Error) => void;
+  const promise = new Promise<void>((done, fail) => {
+    resolve = done;
+    reject = fail;
+  });
+  return { promise, resolve, reject };
+}
+
 const proxySource = "/api/relay/media?url=https%3A%2F%2Ffixture.test%2Ffile";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.mocked(downloadNativeMedia).mockReset();
+});
 
 it.each([
   [1, "1 B"],
@@ -157,10 +171,11 @@ it.each(["application/octet-stream"])(
 
 const nativeSource = `buzz-media://localhost/${encodeURIComponent(`https://relay.test/media/${"a".repeat(64)}.pdf`)}`;
 
-it("downloads authenticated native documents through the host without navigating", () => {
-  vi.mocked(downloadNativeMedia).mockResolvedValue(undefined);
+it("shows pending and completed native downloads without duplicate requests", async () => {
+  const request = deferred();
+  vi.mocked(downloadNativeMedia).mockReturnValueOnce(request.promise);
   const open = vi.fn(() => false);
-  render(
+  const view = render(
     <FileAttachment
       attachment={{
         url: "https://relay.test/media/file",
@@ -170,13 +185,37 @@ it("downloads authenticated native documents through the host without navigating
       source={nativeSource}
       onOpenLink={open}
     />,
+    { wrapper: ToastProvider },
   );
-  const link = screen.getByRole("button", { name: "Download report.pdf" });
-  expect(link).not.toHaveAttribute("href");
+  const button = screen.getByRole("button", { name: "Download report.pdf" });
+  expect(button).not.toHaveAttribute("href");
   expect(screen.getByText("Download file")).toBeInTheDocument();
-  fireEvent.click(link);
-  expect(open).not.toHaveBeenCalled();
-  expect(downloadNativeMedia).toHaveBeenCalledWith(nativeSource, "report.pdf");
+  fireEvent.click(button);
+  try {
+    expect(button).toBeDisabled();
+    expect(button).toHaveAttribute("aria-busy", "true");
+    expect(screen.getByText("Downloading…")).toBeInTheDocument();
+    fireEvent.click(button);
+    expect(downloadNativeMedia).toHaveBeenCalledTimes(1);
+    expect(downloadNativeMedia).toHaveBeenCalledWith(
+      nativeSource,
+      "report.pdf",
+    );
+    expect(open).not.toHaveBeenCalled();
+    expect(
+      screen.queryByRole("dialog", { name: "File saved to Downloads" }),
+    ).toBeNull();
+  } finally {
+    await act(() => request.resolve());
+  }
+  const notice = await screen.findByRole("dialog", {
+    name: "File saved to Downloads",
+  });
+  expect(button).toBeEnabled();
+  expect(button).not.toHaveAttribute("aria-busy", "true");
+  expect(screen.queryByText("Downloading…")).toBeNull();
+  view.rerender(null);
+  expect(notice).toBeInTheDocument();
 });
 
 it.each([
@@ -194,10 +233,12 @@ it.each([
   expect(screen.queryByRole("link")).toBeNull();
 });
 
-it("reports native download failures without navigating", async () => {
-  vi.mocked(downloadNativeMedia).mockRejectedValueOnce(
-    new Error("unavailable"),
-  );
+it("keeps native download failures visible and allows retry", async () => {
+  const request = deferred();
+  const retry = deferred();
+  vi.mocked(downloadNativeMedia)
+    .mockReturnValueOnce(request.promise)
+    .mockReturnValueOnce(retry.promise);
   render(
     <FileAttachment
       attachment={{
@@ -208,9 +249,26 @@ it("reports native download failures without navigating", async () => {
       source={nativeSource}
       onOpenLink={() => false}
     />,
+    { wrapper: ToastProvider },
   );
-  fireEvent.click(screen.getByRole("button", { name: "Download report.pdf" }));
-  await waitFor(() =>
-    expect(screen.getByRole("alert")).toHaveTextContent("Download failed"),
-  );
+  const button = screen.getByRole("button", { name: "Download report.pdf" });
+  fireEvent.click(button);
+  await act(() => request.reject(new Error("unavailable")));
+  expect(await screen.findByRole("alert")).toHaveTextContent("Download failed");
+  expect(button).toBeEnabled();
+  expect(
+    screen.queryByRole("dialog", { name: "File saved to Downloads" }),
+  ).toBeNull();
+  fireEvent.click(button);
+  try {
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(button).toBeDisabled();
+    expect(downloadNativeMedia).toHaveBeenCalledTimes(2);
+  } finally {
+    await act(() => retry.resolve());
+  }
+  expect(
+    await screen.findByRole("dialog", { name: "File saved to Downloads" }),
+  ).toBeInTheDocument();
+  expect(button).toBeEnabled();
 });

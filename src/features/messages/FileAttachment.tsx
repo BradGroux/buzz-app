@@ -12,6 +12,7 @@ import {
 import styles from "./Messages.module.css";
 import { downloadNativeMedia } from "./native-download";
 import { useState } from "react";
+import { useToastNotification } from "../../shared/design-system/ui/Toast";
 
 export function formatFileSize(size: number): string {
   if (size < 1024) return `${size} B`;
@@ -40,6 +41,8 @@ export function FileAttachment({
   onOpenLink(url: string): boolean;
 }) {
   const [downloadError, setDownloadError] = useState(false);
+  const [downloading, setDownloading] = useState(false);
+  const notify = useToastNotification();
   const displayName = attachment.name ?? mimeLabel(attachment.mime) ?? "File";
   const nativeSource = source ? isNativeMediaSource(source) : false;
   const proxySource = source ? isProxySource(source) || nativeSource : false;
@@ -58,13 +61,15 @@ export function FileAttachment({
       <span className={styles.fileAttachmentBody}>
         <span className={styles.fileAttachmentName}>{displayName}</span>
         <span className={styles.fileAttachmentMeta}>
-          {source
-            ? attachment.size
-              ? formatFileSize(attachment.size)
-              : proxySource
-                ? "Download file"
-                : "Open file"
-            : "File unavailable"}
+          {nativeSource && downloading
+            ? "Downloading…"
+            : source
+              ? attachment.size
+                ? formatFileSize(attachment.size)
+                : proxySource
+                  ? "Download file"
+                  : "Open file"
+              : "File unavailable"}
         </span>
       </span>
       {proxySource ? (
@@ -106,11 +111,18 @@ export function FileAttachment({
           className={styles.fileAttachment}
           aria-label={`Download ${displayName}`}
           title={displayName}
+          disabled={downloading}
+          aria-busy={downloading || undefined}
           onClick={() => {
+            if (downloading) return;
+            setDownloading(true);
             setDownloadError(false);
-            void downloadNativeMedia(source, attachment.name ?? "").catch(() =>
-              setDownloadError(true),
-            );
+            void downloadNativeMedia(source, attachment.name ?? "")
+              .then(
+                () => notify("File saved to Downloads", "success"),
+                () => setDownloadError(true),
+              )
+              .finally(() => setDownloading(false));
           }}
         >
           {content}
