@@ -18,9 +18,15 @@ import { matchesEvent } from "../features/relay/projection";
 import type { ReadFilter } from "../features/relay/events";
 import type { ComposerInputElement } from "../features/messages/composer-dom";
 import { composerDOMFixture } from "../features/messages/composer-testing";
+import { downloadNativeMedia } from "../features/messages/native-download";
+import * as persistenceApi from "../features/relay/persistence";
 import * as communityApi from "../features/communities/api";
 
 composerDOMFixture();
+
+vi.mock("../features/messages/native-download", () => ({
+  downloadNativeMedia: vi.fn(),
+}));
 
 // jsdom has no IndexedDB; this flow keeps its message unsent.
 vi.mock("../features/relay/outbox-storage", () => ({
@@ -28,6 +34,9 @@ vi.mock("../features/relay/outbox-storage", () => ({
 }));
 vi.mock("../bundled", async () => {
   const profiles = await import("../bundled/profiles");
+  const { FileAttachment } = await import(
+    "../features/messages/FileAttachment"
+  );
   const { Input } = await import("../shared/design-system/ui/Input");
   return {
     bundledPlugins: [
@@ -45,6 +54,23 @@ vi.mock("../bundled", async () => {
           ...profiles,
           apply(ctx) {
             profiles.apply(ctx);
+            ctx.panels.register({
+              id: "download-fixture",
+              title: "Download fixture",
+              matches: (target) => target === "fixture:download",
+              launcher: { icon: "/buzz-mark.svg", target: "fixture:download" },
+              component: () => (
+                <FileAttachment
+                  attachment={{
+                    url: "https://relay.test/media/file",
+                    kind: "file",
+                    name: "restoration.txt",
+                  }}
+                  source={`buzz-media://localhost/${encodeURIComponent(`https://relay.test/media/${"a".repeat(64)}.txt`)}`}
+                  onOpenLink={() => false}
+                />
+              ),
+            });
             ctx.panels.register({
               id: "draft-companion",
               title: "Draft companion",
@@ -82,6 +108,7 @@ const recipient = finalizeEvent(
 let services: AppServices | undefined;
 afterEach(async () => {
   cleanup();
+  vi.mocked(downloadNativeMedia).mockReset();
   await services?.dispose();
   services = undefined;
   vi.unstubAllGlobals();
@@ -91,7 +118,7 @@ afterEach(async () => {
   window.history.replaceState(null, "", "/");
 });
 
-async function setup(connectionError = false) {
+async function setup(connectionError = false, secondCommunity = false) {
   // jsdom has no media queries; responsive shell geometry is covered in browsers.
   vi.stubGlobal("matchMedia", (media: string) => ({
     media,
@@ -112,7 +139,12 @@ async function setup(connectionError = false) {
     `buzz-client.v1:${viewer}`,
     JSON.stringify({
       profile: { name: "Local name", picture: "" },
-      memberships: [{ id: origin, name: "Fixture community" }],
+      memberships: [
+        { id: origin, name: "Fixture community" },
+        ...(secondCommunity
+          ? [{ id: "https://second.example", name: "Second community" }]
+          : []),
+      ],
       selected: origin,
     }),
   );
@@ -437,3 +469,62 @@ it("retires an open discard prompt once the pending save is sent", async () => {
   );
   expect(screen.getByRole("dialog", { name: "Settings" })).toBe(settings);
 }, 15_000);
+
+it.each(["during", "after"])(
+  "shows download completion %s community restoration",
+  async (timing) => {
+    const user = await setup(false, true);
+    if (!services) throw new Error("Missing app services");
+    const current = services;
+    let finishDownload!: () => void;
+    vi.mocked(downloadNativeMedia).mockReturnValueOnce(
+      new Promise<void>((resolve) => {
+        finishDownload = resolve;
+      }),
+    );
+    await user.click(
+      await screen.findByRole("button", { name: "Download fixture" }),
+    );
+    await user.click(
+      await screen.findByRole("button", { name: "Download restoration.txt" }),
+    );
+    expect(downloadNativeMedia).toHaveBeenCalledOnce();
+    const createPersistence = persistenceApi.createHeadPersistence;
+    let finishRestoration!: () => void;
+    const restoration = new Promise<void>((resolve) => {
+      finishRestoration = resolve;
+    });
+    vi.spyOn(persistenceApi, "createHeadPersistence").mockImplementation(
+      (viewer, relay) => {
+        const persistence = createPersistence(viewer, relay);
+        return relay === "https://second.example"
+          ? {
+              ...persistence,
+              readStartup: async () => {
+                await restoration;
+                return undefined;
+              },
+            }
+          : persistence;
+      },
+    );
+    await act(async () => current.communities.select("https://second.example"));
+    expect(current.relay.snapshot().restoring).toBe(true);
+    expect(
+      screen.queryByRole("button", { name: "Download restoration.txt" }),
+    ).toBeNull();
+    if (timing === "after") {
+      await act(async () => finishRestoration());
+      await waitFor(() =>
+        expect(current.relay.snapshot().restoring).toBeFalsy(),
+      );
+    }
+    await act(async () => finishDownload());
+    expect(await screen.findByText("File saved to Downloads")).toBeVisible();
+    await act(async () => finishRestoration());
+    await waitFor(() => expect(current.relay.snapshot().restoring).toBeFalsy());
+    expect(screen.getByText("File saved to Downloads")).toBeVisible();
+    expect(downloadNativeMedia).toHaveBeenCalledOnce();
+  },
+  15_000,
+);

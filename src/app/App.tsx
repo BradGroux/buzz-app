@@ -74,6 +74,16 @@ export function App({ services }: { services: AppServices }) {
 }
 
 function ConnectedApp({ services }: { services: AppServices }) {
+  return (
+    <ToastProvider
+      portalContainer={document.getElementById("buzz-toast-root") ?? undefined}
+    >
+      <ConnectedAppContent services={services} />
+    </ToastProvider>
+  );
+}
+
+function ConnectedAppContent({ services }: { services: AppServices }) {
   const { plugins } = services;
   const [workspaceElement, setWorkspaceElement] =
     useState<HTMLDivElement | null>(null);
@@ -306,199 +316,195 @@ function ConnectedApp({ services }: { services: AppServices }) {
     </div>
   );
   return (
-    <ToastProvider
-      portalContainer={document.getElementById("buzz-toast-root") ?? undefined}
-    >
-      <ChannelNavigationProvider relay={services.relay}>
-        <AgentsContext.Provider value={services.agents}>
-          <AppShell
-            creationAction={
-              <NewMenu
-                relay={services.relay}
-                navigator={services.navigation}
-                agents={services.agents}
-              />
-            }
-            workspaceRef={setWorkspaceElement}
-            sidebar={(pageNavigation) => (
-              <PrimarySidebar
-                relay={services.relay}
-                navigator={services.navigation}
-                agents={services.agents}
-                chatIcons={services.conversation.chatIcons}
-                target={workspace.target}
-              >
-                {pageNavigation}
-              </PrimarySidebar>
-            )}
-            navigationControls={
-              <NavigationControls navigation={services.navigation} />
-            }
-            onCommunitySelect={selectCommunity}
-            // A scoped Settings target selects its community on the way.
-            onOpenTarget={(target) => void services.navigation.open(target)}
-            communities={services.communities}
-            invite={invite?.viewer === client.viewer ? invite : undefined}
-            onInviteClose={services.invites.clear}
-            settingsCards={services.settingsCards}
-            accountActions={services.accountActions}
-            appearance={services.appearance}
-            searchServices={services}
-            launchers={
-              <PanelLaunchers
-                panels={launcher.available}
-                selected={selectedPanel}
-                launch={launcher.launch}
-              />
-            }
-            companion={pageOwnsCompanion ? undefined : companion}
-            pages={startup === "ready" ? route.pages : []}
-            selected={workspace.selected}
-            navigationAttempt={workspace.attempt}
-            onSelect={select}
-            tone={presentation.tone}
-            workspace={
-              startup === "ready" && workspace.page?.layout === "workspace"
-            }
-          >
-            <UpdateNotice updates={services.updates} />
-            <InterruptedNotice agents={services.agents} />
-            {!settings && startup === "recovery" ? (
-              <RecoveryScreen plugins={plugins} />
-            ) : !settings &&
-              ((!route.state.ingress && route.failure) ||
-                route.state.status === "failed") ? (
-              destinationFailure
-            ) : !settings && route.waiting ? (
+    <ChannelNavigationProvider relay={services.relay}>
+      <AgentsContext.Provider value={services.agents}>
+        <AppShell
+          creationAction={
+            <NewMenu
+              relay={services.relay}
+              navigator={services.navigation}
+              agents={services.agents}
+            />
+          }
+          workspaceRef={setWorkspaceElement}
+          sidebar={(pageNavigation) => (
+            <PrimarySidebar
+              relay={services.relay}
+              navigator={services.navigation}
+              agents={services.agents}
+              chatIcons={services.conversation.chatIcons}
+              target={workspace.target}
+            >
+              {pageNavigation}
+            </PrimarySidebar>
+          )}
+          navigationControls={
+            <NavigationControls navigation={services.navigation} />
+          }
+          onCommunitySelect={selectCommunity}
+          // A scoped Settings target selects its community on the way.
+          onOpenTarget={(target) => void services.navigation.open(target)}
+          communities={services.communities}
+          invite={invite?.viewer === client.viewer ? invite : undefined}
+          onInviteClose={services.invites.clear}
+          settingsCards={services.settingsCards}
+          accountActions={services.accountActions}
+          appearance={services.appearance}
+          searchServices={services}
+          launchers={
+            <PanelLaunchers
+              panels={launcher.available}
+              selected={selectedPanel}
+              launch={launcher.launch}
+            />
+          }
+          companion={pageOwnsCompanion ? undefined : companion}
+          pages={startup === "ready" ? route.pages : []}
+          selected={workspace.selected}
+          navigationAttempt={workspace.attempt}
+          onSelect={select}
+          tone={presentation.tone}
+          workspace={
+            startup === "ready" && workspace.page?.layout === "workspace"
+          }
+        >
+          <UpdateNotice updates={services.updates} />
+          <InterruptedNotice agents={services.agents} />
+          {!settings && startup === "recovery" ? (
+            <RecoveryScreen plugins={plugins} />
+          ) : !settings &&
+            ((!route.state.ingress && route.failure) ||
+              route.state.status === "failed") ? (
+            destinationFailure
+          ) : !settings && route.waiting ? (
+            <p role="status">Opening destination…</p>
+          ) : startup === "loading" || restoring ? (
+            settings ? null : (
               <p role="status">Opening destination…</p>
-            ) : startup === "loading" || restoring ? (
-              settings ? null : (
-                <p role="status">Opening destination…</p>
-              )
-            ) : workspace.page ? (
-              <PageView
-                page={workspace.page}
-                navigation={workspace.request}
-                companion={pageOwnsCompanion ? companion : undefined}
-                companionOpening={
-                  pageOwnsCompanion ? launcher.opening : undefined
-                }
+            )
+          ) : workspace.page ? (
+            <PageView
+              page={workspace.page}
+              navigation={workspace.request}
+              companion={pageOwnsCompanion ? companion : undefined}
+              companionOpening={
+                pageOwnsCompanion ? launcher.opening : undefined
+              }
+            />
+          ) : null}
+        </AppShell>
+        <Dialog
+          // The inert launch surface would swallow the modal's initial focus.
+          open={settings && !launching}
+          title="Settings"
+          closeLabel="Close Settings"
+          size="expanded"
+          container={workspaceElement}
+          navigation={{
+            label: "Settings sections",
+            content: (
+              <SettingsSidebar
+                cards={services.settingsCards}
+                communities={services.communities}
+                {...(route.target.kind === "settings" && route.target.section
+                  ? { selected: route.target.section }
+                  : {})}
+                onSection={openSettingsSection}
               />
-            ) : null}
-          </AppShell>
-          <Dialog
-            // The inert launch surface would swallow the modal's initial focus.
-            open={settings && !launching}
-            title="Settings"
-            closeLabel="Close Settings"
-            size="expanded"
-            container={workspaceElement}
-            navigation={{
-              label: "Settings sections",
-              content: (
-                <SettingsSidebar
-                  cards={services.settingsCards}
-                  communities={services.communities}
-                  {...(route.target.kind === "settings" && route.target.section
-                    ? { selected: route.target.section }
-                    : {})}
-                  onSection={openSettingsSection}
-                />
-              ),
-            }}
-            onOpenChange={(open) => {
-              if (open) return;
-              if (settingsUnsaved) setConfirmSettingsDiscard(true);
-              else route.leaveSettings();
-            }}
-            initialFocus={() => {
-              // A destination that already focused a setting keeps it.
-              const active = document.activeElement;
-              return active instanceof HTMLElement &&
-                document.getElementById("settings-content")?.contains(active)
-                ? active
-                : true;
-            }}
-            finalFocus={() => {
-              // Only a return to the visit Settings covered restores the prior
-              // focus; a destination opened from Settings starts at main.
-              const returning =
-                services.navigation.snapshot().entry.id ===
-                settingsReturnEntry.current;
-              return returning &&
-                settingsFocus.current?.isConnected &&
-                settingsFocus.current !== document.body
-                ? settingsFocus.current
-                : (document.getElementById("main-content") ?? false);
-            }}
-          >
-            <div id="settings-content" className="h-full" tabIndex={-1}>
-              {(!route.state.ingress && route.failure) ||
-              route.state.status === "failed" ? (
-                destinationFailure
-              ) : route.waiting ? (
-                <p role="status">Opening destination…</p>
-              ) : (
-                <Settings
-                  agents={services.agents}
-                  decisions={services.decisions}
-                  plugins={plugins}
-                  cards={services.settingsCards}
-                  adminAccess={services.adminAccess}
-                  communities={services.communities}
-                  identity={services.identity}
-                  appearance={services.appearance}
-                  shortcuts={services.shortcuts}
-                  shortcutBindings={services.shortcutBindings}
-                  notifications={services.notifications}
-                  updates={services.updates}
-                  navigation={route.request}
-                  navigationPane
-                  onDeparturePending={(pending) => {
-                    const client = services.communities.snapshot();
-                    const attempt = route.state.attempt;
-                    if (pending && client.viewer && client.selected)
-                      setDeparture({
-                        attempt,
-                        viewer: client.viewer,
-                        communityId: client.selected,
-                      });
-                    else if (!pending)
-                      setDeparture((current) =>
-                        current?.attempt === attempt ? null : current,
-                      );
-                  }}
-                  onSection={openSettingsSection}
-                  onUnsavedChange={setSettingsUnsaved}
-                />
-              )}
-            </div>
-            {confirmSettingsDiscard && settings && settingsUnsaved && (
-              <AlertDialog
-                title="Discard changes?"
-                description="Your profile has unsaved changes."
-                onClose={() => setConfirmSettingsDiscard(false)}
-                actions={
-                  <>
-                    <Button onClick={() => setConfirmSettingsDiscard(false)}>
-                      Keep editing
-                    </Button>
-                    <Button
-                      variant="destructive"
-                      onClick={() => {
-                        setConfirmSettingsDiscard(false);
-                        route.leaveSettings();
-                      }}
-                    >
-                      Discard changes
-                    </Button>
-                  </>
-                }
+            ),
+          }}
+          onOpenChange={(open) => {
+            if (open) return;
+            if (settingsUnsaved) setConfirmSettingsDiscard(true);
+            else route.leaveSettings();
+          }}
+          initialFocus={() => {
+            // A destination that already focused a setting keeps it.
+            const active = document.activeElement;
+            return active instanceof HTMLElement &&
+              document.getElementById("settings-content")?.contains(active)
+              ? active
+              : true;
+          }}
+          finalFocus={() => {
+            // Only a return to the visit Settings covered restores the prior
+            // focus; a destination opened from Settings starts at main.
+            const returning =
+              services.navigation.snapshot().entry.id ===
+              settingsReturnEntry.current;
+            return returning &&
+              settingsFocus.current?.isConnected &&
+              settingsFocus.current !== document.body
+              ? settingsFocus.current
+              : (document.getElementById("main-content") ?? false);
+          }}
+        >
+          <div id="settings-content" className="h-full" tabIndex={-1}>
+            {(!route.state.ingress && route.failure) ||
+            route.state.status === "failed" ? (
+              destinationFailure
+            ) : route.waiting ? (
+              <p role="status">Opening destination…</p>
+            ) : (
+              <Settings
+                agents={services.agents}
+                decisions={services.decisions}
+                plugins={plugins}
+                cards={services.settingsCards}
+                adminAccess={services.adminAccess}
+                communities={services.communities}
+                identity={services.identity}
+                appearance={services.appearance}
+                shortcuts={services.shortcuts}
+                shortcutBindings={services.shortcutBindings}
+                notifications={services.notifications}
+                updates={services.updates}
+                navigation={route.request}
+                navigationPane
+                onDeparturePending={(pending) => {
+                  const client = services.communities.snapshot();
+                  const attempt = route.state.attempt;
+                  if (pending && client.viewer && client.selected)
+                    setDeparture({
+                      attempt,
+                      viewer: client.viewer,
+                      communityId: client.selected,
+                    });
+                  else if (!pending)
+                    setDeparture((current) =>
+                      current?.attempt === attempt ? null : current,
+                    );
+                }}
+                onSection={openSettingsSection}
+                onUnsavedChange={setSettingsUnsaved}
               />
             )}
-          </Dialog>
-        </AgentsContext.Provider>
-      </ChannelNavigationProvider>
-    </ToastProvider>
+          </div>
+          {confirmSettingsDiscard && settings && settingsUnsaved && (
+            <AlertDialog
+              title="Discard changes?"
+              description="Your profile has unsaved changes."
+              onClose={() => setConfirmSettingsDiscard(false)}
+              actions={
+                <>
+                  <Button onClick={() => setConfirmSettingsDiscard(false)}>
+                    Keep editing
+                  </Button>
+                  <Button
+                    variant="destructive"
+                    onClick={() => {
+                      setConfirmSettingsDiscard(false);
+                      route.leaveSettings();
+                    }}
+                  >
+                    Discard changes
+                  </Button>
+                </>
+              }
+            />
+          )}
+        </Dialog>
+      </AgentsContext.Provider>
+    </ChannelNavigationProvider>
   );
 }
