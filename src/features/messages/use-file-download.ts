@@ -6,6 +6,16 @@ type State = "downloading" | "failed";
 const operations = new Map<string, State>();
 const observers = new Map<string, Set<() => void>>();
 
+// Preserve errors across virtualization without retaining an unbounded history.
+// Visible errors and pending operations are never evicted.
+function pruneFailures() {
+  const unobserved = [...operations].filter(
+    ([key, state]) => state === "failed" && !observers.has(key),
+  );
+  for (const [key] of unobserved.slice(0, Math.max(0, unobserved.length - 100)))
+    operations.delete(key);
+}
+
 function changed(key: string) {
   for (const listener of observers.get(key) ?? []) listener();
 }
@@ -23,7 +33,7 @@ export function useFileDownload(source: string | undefined, name: string) {
         listeners.delete(listener);
         if (listeners.size) return;
         observers.delete(key);
-        if (operations.get(key) !== "downloading") operations.delete(key);
+        pruneFailures();
       };
     },
     [key],
@@ -47,8 +57,9 @@ export function useFileDownload(source: string | undefined, name: string) {
           notify("File saved to Downloads", "success");
         },
         () => {
-          if (observers.has(key)) operations.set(key, "failed");
-          else operations.delete(key);
+          operations.delete(key);
+          operations.set(key, "failed");
+          pruneFailures();
           changed(key);
         },
       );

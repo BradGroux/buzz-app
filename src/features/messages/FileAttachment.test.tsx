@@ -9,6 +9,7 @@ import {
 } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import userEvent from "@testing-library/user-event";
+import { StrictMode } from "react";
 import { ToastProvider } from "../../shared/design-system/ui/Toast";
 import { downloadNativeMedia } from "./native-download";
 import { FileAttachment, formatFileSize } from "./FileAttachment";
@@ -373,4 +374,82 @@ it("shares pending state across cards but not different destinations", async () 
   }
   expect(buttons[0]).not.toHaveAttribute("aria-busy", "true");
   expect(buttons[1]).not.toHaveAttribute("aria-busy", "true");
+});
+
+it("restores a failure that settled while its card was absent and allows retry", async () => {
+  const request = deferred();
+  const retry = deferred();
+  vi.mocked(downloadNativeMedia)
+    .mockReturnValueOnce(request.promise)
+    .mockReturnValueOnce(retry.promise);
+  const card = (
+    <StrictMode>
+      <FileAttachment
+        attachment={{
+          url: "https://relay.test/file",
+          kind: "file",
+          name: "absence-report.pdf",
+        }}
+        source={nativeSource}
+        onOpenLink={() => false}
+      />
+    </StrictMode>
+  );
+  const view = render(card, { wrapper: ToastProvider });
+  fireEvent.click(
+    screen.getByRole("button", { name: "Download absence-report.pdf" }),
+  );
+  view.rerender(null);
+  await act(() => request.reject(new Error("offline")));
+  view.rerender(card);
+  expect(await screen.findByRole("alert")).toHaveTextContent("Download failed");
+  fireEvent.click(
+    screen.getByRole("button", { name: "Download absence-report.pdf" }),
+  );
+  try {
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(downloadNativeMedia).toHaveBeenCalledTimes(2);
+  } finally {
+    await act(() => retry.resolve());
+  }
+  expect(
+    await screen.findByRole("dialog", { name: "File saved to Downloads" }),
+  ).toBeInTheDocument();
+});
+
+it("bounds absent failures while keeping visible errors", async () => {
+  const requests = Array.from({ length: 102 }, () => deferred());
+  for (const request of requests)
+    vi.mocked(downloadNativeMedia).mockReturnValueOnce(request.promise);
+  const card = (index: number) => (
+    <FileAttachment
+      key={index}
+      attachment={{
+        url: "https://relay.test/file",
+        kind: "file",
+        name: `cache-${index}.pdf`,
+      }}
+      source={nativeSource}
+      onOpenLink={() => false}
+    />
+  );
+  const view = render(
+    requests.map((_, index) => card(index)),
+    {
+      wrapper: ToastProvider,
+    },
+  );
+  for (const button of screen.getAllByRole("button", {
+    name: /Download cache-/,
+  }))
+    fireEvent.click(button);
+  view.rerender(card(0));
+  await act(() => {
+    for (const request of requests) request.reject(new Error("offline"));
+  });
+  expect(screen.getByRole("alert")).toHaveTextContent("Download failed");
+  view.rerender(card(1));
+  expect(screen.queryByRole("alert")).toBeNull();
+  view.rerender(card(101));
+  expect(await screen.findByRole("alert")).toHaveTextContent("Download failed");
 });
