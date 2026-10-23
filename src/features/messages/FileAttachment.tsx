@@ -10,9 +10,7 @@ import {
   safeOpenUrl,
 } from "./attachment-source";
 import styles from "./Messages.module.css";
-import { downloadNativeMedia } from "./native-download";
-import { useState } from "react";
-import { useToastNotification } from "../../shared/design-system/ui/Toast";
+import { useFileDownload } from "./use-file-download";
 
 export function formatFileSize(size: number): string {
   if (size < 1024) return `${size} B`;
@@ -40,9 +38,10 @@ export function FileAttachment({
   source: string | undefined;
   onOpenLink(url: string): boolean;
 }) {
-  const [downloadError, setDownloadError] = useState(false);
-  const [downloading, setDownloading] = useState(false);
-  const notify = useToastNotification();
+  const { downloading, downloadError, download } = useFileDownload(
+    source,
+    attachment.name ?? "",
+  );
   const displayName = attachment.name ?? mimeLabel(attachment.mime) ?? "File";
   const nativeSource = source ? isNativeMediaSource(source) : false;
   const proxySource = source ? isProxySource(source) || nativeSource : false;
@@ -111,19 +110,9 @@ export function FileAttachment({
           className={styles.fileAttachment}
           aria-label={`Download ${displayName}`}
           title={displayName}
-          disabled={downloading}
+          aria-disabled={downloading || undefined}
           aria-busy={downloading || undefined}
-          onClick={() => {
-            if (downloading) return;
-            setDownloading(true);
-            setDownloadError(false);
-            void downloadNativeMedia(source, attachment.name ?? "")
-              .then(
-                () => notify("File saved to Downloads", "success"),
-                () => setDownloadError(true),
-              )
-              .finally(() => setDownloading(false));
-          }}
+          onClick={download}
         >
           {content}
         </button>
